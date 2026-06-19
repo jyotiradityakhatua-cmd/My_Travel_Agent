@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+env/
+ENV/
+
+# Byte-compiled / distribution
+*.pyc
+*.pyo
+*.pyd
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Node / frontend
+node_modules/
+frontend/node_modules/
+dist/
+build/
+out/
+.vite/
+
+# Vite / production
+frontend/dist/
+
+# Environment files
+.env
+.env.*
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# IDEs and editors
+.vscode/
+.idea/
+*.sublime-workspace
+
+# TypeScript
+*.tsbuildinfo
+
+# Testing coverage
+coverage/
+.vitest/
+.coverage
+htmlcov/
+
+# Caches
+.cache/
+.parcel-cache/
+.sass-cache/
+.cache/
+.mypy_cache/
+
+# Databases
+*.sqlite3
+*.db
+
+# OS files
+.DS_Store
+
+# Misc
+.eslintcache
+*.local
