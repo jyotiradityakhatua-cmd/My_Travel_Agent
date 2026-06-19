@@ -48,18 +48,7 @@ app = FastAPI()
  
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "null",                      # HTML opened as local file (file://)
-        "http://localhost:5173",     # Vite dev server
-        "http://localhost:3000",     # React/Next dev server
-        "http://localhost:8080",     # Vue dev server
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:5500",     # VS Code Live Server
-        "http://localhost:5500",
-        "http://localhost:11434/api/chat"
-    ],
-    allow_credentials=True,
+    allow_origins=["https://your-frontend.vercel.app"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
