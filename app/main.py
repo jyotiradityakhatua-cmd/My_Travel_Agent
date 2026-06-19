@@ -30,21 +30,13 @@
 # from fastapi import FastAPI
 from app.api.router import api_router
 from app.routes.chat import router as chat_router
-
-
-# from app.db.init_db import init_db
-
-# app = FastAPI()
-# init_db()
-
-# app.include_router(api_router)
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.db.init_db import init_db
- 
+
 init_db()
 app = FastAPI()
- 
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -52,6 +44,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
- 
+
 app.include_router(api_router)
- 
+app.include_router(chat_router, prefix="/chat")  # ← ADD THIS
