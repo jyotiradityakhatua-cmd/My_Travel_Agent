@@ -138,11 +138,71 @@
 #     return response.json()["response"]
 
 
+# from app.llm.llm_client import generate_full
+
+
+# def search_hotel(destination, check_in, check_out, budget=""):
+#     """Call Groq to generate realistic hotel options. Returns raw text."""
+
+#     budget_instruction = ""
+#     if budget:
+#         budget_instruction = f"""
+# BUDGET CONSTRAINT: The user's total trip budget is {budget}.
+# - Prioritize hotels that are affordable within this overall budget.
+# - Always show the cheapest suitable option first.
+# - Flag any hotel whose total stay cost alone would exceed {budget} with a ⚠️ warning.
+# - Focus on budget and mid-range options; include luxury only if budget allows.
+# """
+
+#     prompt = f"""
+# You are a hotel recommendation assistant.
+
+# Generate HOTEL OPTIONS in MARKDOWN format only.
+
+# STRICT RULES:
+# - Output ONLY Markdown
+# - No explanations
+# - No JSON
+# - Use clean table format
+# - Make prices realistic for the destination
+# - Include 5–8 hotel options
+# - Vary budget (budget / mid-range / luxury)
+# {budget_instruction}
+# ---
+
+# ## SEARCH DETAILS
+# - Destination: {destination}
+# - Check-in: {check_in}
+# - Check-out: {check_out}
+
+# ---
+
+# ## REQUIRED OUTPUT FORMAT
+
+# ### Available Hotels
+
+
+# | Hotel Name | Destination | Rating | Price Per Night (INR) | Total Estimated Cost | Hotel Contact Number | Hotel Website |
+# |------------|-------------|--------|------------------------|----------------------|---------------------|--------------|
+
+# Rules:
+# - If actual contact information is unavailable, write "Contact information not available".
+# - phone numbers.
+# - Never invent owner names.
+# - generate  websites.
+
+# Make sure prices are consistent with destination popularity.
+# """
+#     return generate_full(prompt)
+
+
+
 from app.llm.llm_client import generate_full
 
 
-def search_hotel(destination, check_in, check_out, budget=""):
-    """Call Groq to generate realistic hotel options. Returns raw text."""
+async def search_hotel(destination: str, check_in: str, check_out: str,
+                       budget: str = "") -> str:
+    """Async: call Groq to generate realistic hotel options. Returns raw text."""
 
     budget_instruction = ""
     if budget:
@@ -181,16 +241,14 @@ STRICT RULES:
 
 ### Available Hotels
 
-
 | Hotel Name | Destination | Rating | Price Per Night (INR) | Total Estimated Cost | Hotel Contact Number | Hotel Website |
 |------------|-------------|--------|------------------------|----------------------|---------------------|--------------|
 
 Rules:
 - If actual contact information is unavailable, write "Contact information not available".
-- phone numbers.
 - Never invent owner names.
-- generate  websites.
+- Generate websites.
 
 Make sure prices are consistent with destination popularity.
 """
-    return generate_full(prompt)
+    return await generate_full(prompt)
