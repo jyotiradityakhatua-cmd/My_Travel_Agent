@@ -1512,11 +1512,302 @@
 
 
 
+# import json
+# import re
+# import math
+# import time
+# import requests
+# import os
+# from dotenv import load_dotenv
+
+# from app.llm.llm_client import generate_full as _generate_full, stream_generate as _stream_generate
+
+# load_dotenv()
+
+# NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+# NOMINATIM_HEADERS = {"User-Agent": "ai-travel-agent/1.0"}
+
+# MAX_DISTANCE_KM = 60
+
+
+# def _extract_json_array(text: str) -> list:
+#     text = re.sub(r"```(?:json)?|```", "", text).strip()
+#     try:
+#         d = json.loads(text)
+#         if isinstance(d, list):
+#             return d
+#     except Exception:
+#         pass
+#     m = re.search(r"\[[\s\S]*\]", text)
+#     if m:
+#         try:
+#             d = json.loads(m.group())
+#             if isinstance(d, list):
+#                 return d
+#         except Exception:
+#             pass
+#     return []
+
+
+# def _haversine_km(lat1, lng1, lat2, lng2) -> float:
+#     R = 6371.0
+#     p1, p2 = math.radians(lat1), math.radians(lat2)
+#     dphi = math.radians(lat2 - lat1)
+#     dlmb = math.radians(lng2 - lng1)
+#     a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
+#     return 2 * R * math.asin(math.sqrt(a))
+
+
+# def _geocode(query: str):
+#     """Real geocoding via Nominatim (OpenStreetMap) — free, no API key."""
+#     try:
+#         r = requests.get(
+#             NOMINATIM_URL,
+#             params={"q": query, "format": "json", "limit": 1},
+#             headers=NOMINATIM_HEADERS,
+#             timeout=10,
+#         )
+#         r.raise_for_status()
+#         data = r.json()
+#         if data:
+#             return float(data[0]["lat"]), float(data[0]["lon"]), data[0].get("display_name", query)
+#     except Exception as e:
+#         print(f"[GEOCODE] failed for '{query}': {e}")
+#     return None
+
+
+# def _get_destination_anchor(dst: str):
+#     """Get the real-world center coordinates of the destination city."""
+#     geo = _geocode(dst)
+#     if geo:
+#         lat, lng, _ = geo
+#         return lat, lng
+#     return None, None
+
+
+# def _get_locations_json(dst: str, hotels: str, days: int) -> list:
+#     """
+#     Step 1: ask the LLM to NAME real hotels/attractions (no coordinates).
+#     Step 2: geocode each name via Nominatim, anchored to the destination city.
+#     Step 3: discard anything too far from the destination anchor.
+#     """
+#     name_prompt = f"""Destination: {dst}
+
+# Hotel options to choose from:
+# {hotels}
+
+# I am about to write a {days}-day itinerary for {dst}. List ONLY real-world place NAMES (no coordinates) to pin on a map:
+# 1. The single best hotel from the list above (pick one) — use its exact name.
+# 2. 6 to 10 well-known REAL attractions, landmarks, beaches, markets, or famous restaurant areas that are actually located in {dst} — places a real {days}-day itinerary for {dst} would visit.
+
+# Return ONLY a raw JSON array, nothing else. No markdown, no explanation.
+
+# Format exactly like this:
+# [
+#   {{"name":"Exact Hotel Name","type":"hotel"}},
+#   {{"name":"Attraction Name","type":"attraction"}},
+#   {{"name":"Restaurant or Food Area Name","type":"restaurant"}}
+# ]
+
+# type must be one of: hotel, attraction, restaurant, transport, other.
+# Output ONLY the JSON array now:
+# """
+#     try:
+#         raw = _generate_full(name_prompt)
+#         named = _extract_json_array(raw)
+#     except Exception as e:
+#         print(f"[ITINERARY] Name list failed: {e}")
+#         return []
+
+#     if not named:
+#         return []
+
+#     anchor_lat, anchor_lng = _get_destination_anchor(dst)
+
+#     clean = []
+#     for item in named:
+#         if not isinstance(item, dict) or not item.get("name"):
+#             continue
+#         name = item["name"].strip()
+#         place_type = item.get("type", "other")
+
+#         geo = _geocode(f"{name}, {dst}")
+#         if not geo:
+#             geo = _geocode(name)
+#         if not geo:
+#             continue
+
+#         lat, lng, display_name = geo
+
+#         if anchor_lat is not None:
+#             dist = _haversine_km(anchor_lat, anchor_lng, lat, lng)
+#             if dist > MAX_DISTANCE_KM:
+#                 print(f"[ITINERARY] Discarding '{name}' — {dist:.0f}km from {dst}")
+#                 continue
+
+#         clean.append({
+#             "name": name,
+#             "type": place_type,
+#             "lat": lat,
+#             "lng": lng,
+#             "address": display_name,
+#         })
+
+#         time.sleep(1)  # respect Nominatim's 1 request/sec rate limit
+
+#     return clean
+
+
+# def build_itnerary(data: dict, flights: str, hotels: str):
+#     src    = data.get("source", "")
+#     dst    = data.get("destination", "")
+#     dep    = data.get("departure_date", "")
+#     ret    = data.get("return_date", "")
+#     days   = data.get("days", 3)
+#     budget = data.get("budget", "") or ""
+
+#     budget_section = ""
+#     if budget:
+#         budget_section = f"""
+# ## 💰 Budget Constraint
+# The user's total budget is **{budget}**. Throughout this itinerary:
+# - Choose the flight and hotel that best fit within this budget.
+# - Suggest free or low-cost activities where possible.
+# - Flag any recommendation that strains the budget with a ⚠️ note.
+# - Include a realistic budget breakdown showing how the {budget} is allocated.
+# """
+
+#     # ── Step 1: get real, geocoded coordinates for hotel + attractions ────────
+#     locations = _get_locations_json(dst, hotels, days)
+
+#     place_names_hint = ""
+#     if locations:
+#         names = ", ".join(f'"{l["name"]}"' for l in locations)
+#         place_names_hint = (
+#             f"\nIMPORTANT: When mentioning the hotel or attractions below, "
+#             f"use these EXACT names so they match the map: {names}\n"
+#         )
+
+#     # ── Step 2: build the itinerary text ─────────────────────────────────────
+#     prompt = f"""You are a warm, expert travel planner. Write a complete, detailed travel itinerary in Markdown.
+# Be specific, practical, and conversational — like a knowledgeable friend planning this trip for someone.
+# Never skip any day. Never say "etc" or "and so on".
+
+# TRIP:
+# - From: {src} → To: {dst}
+# - Departure: {dep} | Return: {ret}
+# - Duration: {days} days
+# {f"- Total Budget: {budget}" if budget else ""}
+
+# FLIGHTS AVAILABLE:
+# {flights}
+
+# HOTELS AVAILABLE:
+# {hotels}
+# {place_names_hint}
+# {budget_section}
+# ---
+
+# # ✈️ {src} → {dst} | {dep} – {ret} ({days} Days)
+
+# ---
+
+# ## 🛫 Your Flights
+# Pick the best departure and return flight from the list above{f" that fits within the {budget} budget" if budget else ""}.
+# Show: **Airline · Flight No · Time · Duration · Price**
+# Give one sentence on why you picked it.
+
+# ---
+
+# ## 🏨 Your Hotel
+# Pick the best hotel from the list above (use the exact name from the hint if provided){f" that fits within the {budget} budget" if budget else ""}.
+# Show: **Hotel Name · Price/night · Total ({days} nights)**
+# Give one sentence on why it suits this trip.
+
+# ---
+
+# ## 📅 Day-by-Day Plan
+# Write EVERY day. Day 1 through Day {days}. No exceptions.
+# When mentioning attractions, use the exact names from the hint above where relevant.
+# {"Prefer free or low-cost activities to stay within budget." if budget else ""}
+
+# ### Day 1 — Arrival in {dst}
+# **🌅 Morning:** [arrival + check-in + first impressions]
+# **☀️ Afternoon:** [first activity or nearby attraction]
+# **🌆 Evening:** [dinner spot + evening plan]
+# **🍴 Eat tonight:** [specific dish + restaurant name in {dst}]
+
+# ### Day 2
+# **🌅 Morning:** ...
+# **☀️ Afternoon:** ...
+# **🌆 Evening:** ...
+# **🍴 Eat tonight:** ...
+
+# [Continue this exact format for Days 3 through {days - 1}]
+
+# ### Day {days} — Departure
+# **🌅 Morning:** [last activity + checkout]
+# **☀️ Afternoon:** [airport transfer]
+# **✈️ Flight home:** [return flight details from your chosen flight above]
+
+# ---
+
+# ## 🍽️ Must-Try Foods in {dst}
+# Exactly 6 dishes. Format:
+# **Dish name** — one line description of taste + where to find it.
+
+# ---
+
+# ## 🚌 Getting Around {dst}
+# Practical transport guide covering:
+# - Metro/local train (if available) — fares
+# - Auto-rickshaw — typical fare range
+# - Cab apps (Ola/Uber) — typical fare range
+# - Tips for getting around like a local
+
+# ---
+
+# ## 💰 Full Budget Breakdown
+
+# | Category | Cost (INR) |
+# |---|---|
+# | Flights — return | ₹X,XXX |
+# | Hotel — {days} nights | ₹X,XXX |
+# | Food & dining | ₹X,XXX |
+# | Local transport | ₹X,XXX |
+# | Activities & entry fees | ₹X,XXX |
+# | Shopping & misc | ₹X,XXX |
+# | **Total Estimated** | **₹XX,XXX** |
+# {f"| **User Budget** | **{budget}** |" if budget else ""}
+# {f"| **Remaining / Over** | ₹ (calculate difference) |" if budget else ""}
+
+# ---
+
+# ## 💡 Top 5 Travel Tips for {dst}
+# Write 5 practical, specific tips — not generic advice.
+
+# ---
+
+# ## 🌤️ Weather & What to Pack
+# What weather to expect in {dst} from {dep} to {ret}.
+# Specific packing list for this trip.
+# """
+
+#     for token in _stream_generate(prompt):
+#         yield token
+
+#     # ── Step 3: append hidden JSON tag for the frontend map ──────────────────
+#     if locations:
+#         json_str = json.dumps(locations, ensure_ascii=False)
+#         yield f"\n\n<!--LOCATIONS_JSON:{json_str}-->"
+
+
+
 import json
 import re
 import math
-import time
-import requests
+import asyncio
+import httpx
 import os
 from dotenv import load_dotenv
 
@@ -1528,6 +1819,12 @@ NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 NOMINATIM_HEADERS = {"User-Agent": "ai-travel-agent/1.0"}
 
 MAX_DISTANCE_KM = 60
+
+# Simple async-safe in-process geocode cache
+_GEOCODE_CACHE: dict = {}
+# Nominatim rate-limit: 1 req/sec — use a semaphore
+_NOMINATIM_SEMAPHORE = asyncio.Semaphore(1)
+_LAST_NOMINATIM_CALL: float = 0.0
 
 
 def _extract_json_array(text: str) -> list:
@@ -1558,38 +1855,61 @@ def _haversine_km(lat1, lng1, lat2, lng2) -> float:
     return 2 * R * math.asin(math.sqrt(a))
 
 
-def _geocode(query: str):
-    """Real geocoding via Nominatim (OpenStreetMap) — free, no API key."""
-    try:
-        r = requests.get(
-            NOMINATIM_URL,
-            params={"q": query, "format": "json", "limit": 1},
-            headers=NOMINATIM_HEADERS,
-            timeout=10,
-        )
-        r.raise_for_status()
-        data = r.json()
-        if data:
-            return float(data[0]["lat"]), float(data[0]["lon"]), data[0].get("display_name", query)
-    except Exception as e:
-        print(f"[GEOCODE] failed for '{query}': {e}")
+async def _geocode(query: str):
+    """Async geocoding via Nominatim with a 1 req/sec rate limit."""
+    global _LAST_NOMINATIM_CALL
+
+    key = query.strip().lower()
+    if key in _GEOCODE_CACHE:
+        return _GEOCODE_CACHE[key]
+
+    async with _NOMINATIM_SEMAPHORE:
+        # Enforce 1-second spacing between requests
+        now = asyncio.get_event_loop().time()
+        wait = _LAST_NOMINATIM_CALL + 1.1 - now
+        if wait > 0:
+            await asyncio.sleep(wait)
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(
+                    NOMINATIM_URL,
+                    params={"q": query, "format": "json", "limit": 1},
+                    headers=NOMINATIM_HEADERS,
+                )
+                r.raise_for_status()
+                data = r.json()
+                _LAST_NOMINATIM_CALL = asyncio.get_event_loop().time()
+                if data:
+                    result = (
+                        float(data[0]["lat"]),
+                        float(data[0]["lon"]),
+                        data[0].get("display_name", query),
+                    )
+                    _GEOCODE_CACHE[key] = result
+                    return result
+                else:
+                    print(f"[GEOCODE] no results for '{query}'")
+        except Exception as e:
+            print(f"[GEOCODE] failed for '{query}': {e}")
+            _LAST_NOMINATIM_CALL = asyncio.get_event_loop().time()
+
+    _GEOCODE_CACHE[key] = None
     return None
 
 
-def _get_destination_anchor(dst: str):
-    """Get the real-world center coordinates of the destination city."""
-    geo = _geocode(dst)
+async def _get_destination_anchor(dst: str):
+    geo = await _geocode(dst)
     if geo:
-        lat, lng, _ = geo
-        return lat, lng
+        return geo[0], geo[1]
     return None, None
 
 
-def _get_locations_json(dst: str, hotels: str, days: int) -> list:
+async def _get_locations_json(dst: str, hotels: str, days: int) -> list:
     """
-    Step 1: ask the LLM to NAME real hotels/attractions (no coordinates).
-    Step 2: geocode each name via Nominatim, anchored to the destination city.
-    Step 3: discard anything too far from the destination anchor.
+    Step 1: ask LLM to NAME real places (no coords — LLMs hallucinate coords).
+    Step 2: geocode each name via Nominatim (async, rate-limited).
+    Step 3: discard anything > MAX_DISTANCE_KM from the destination anchor.
     """
     name_prompt = f"""Destination: {dst}
 
@@ -1613,7 +1933,7 @@ type must be one of: hotel, attraction, restaurant, transport, other.
 Output ONLY the JSON array now:
 """
     try:
-        raw = _generate_full(name_prompt)
+        raw = await _generate_full(name_prompt)
         named = _extract_json_array(raw)
     except Exception as e:
         print(f"[ITINERARY] Name list failed: {e}")
@@ -1622,20 +1942,20 @@ Output ONLY the JSON array now:
     if not named:
         return []
 
-    anchor_lat, anchor_lng = _get_destination_anchor(dst)
+    anchor_lat, anchor_lng = await _get_destination_anchor(dst)
 
-    clean = []
-    for item in named:
+    # Geocode all named places concurrently (semaphore enforces rate limit)
+    async def _resolve(item: dict):
         if not isinstance(item, dict) or not item.get("name"):
-            continue
+            return None
         name = item["name"].strip()
         place_type = item.get("type", "other")
 
-        geo = _geocode(f"{name}, {dst}")
+        geo = await _geocode(f"{name}, {dst}")
         if not geo:
-            geo = _geocode(name)
+            geo = await _geocode(name)
         if not geo:
-            continue
+            return None
 
         lat, lng, display_name = geo
 
@@ -1643,22 +1963,25 @@ Output ONLY the JSON array now:
             dist = _haversine_km(anchor_lat, anchor_lng, lat, lng)
             if dist > MAX_DISTANCE_KM:
                 print(f"[ITINERARY] Discarding '{name}' — {dist:.0f}km from {dst}")
-                continue
+                return None
 
-        clean.append({
+        return {
             "name": name,
             "type": place_type,
             "lat": lat,
             "lng": lng,
             "address": display_name,
-        })
+        }
 
-        time.sleep(1)  # respect Nominatim's 1 request/sec rate limit
+    results = await asyncio.gather(*[_resolve(item) for item in named])
+    return [r for r in results if r is not None]
 
-    return clean
 
-
-def build_itnerary(data: dict, flights: str, hotels: str):
+async def build_itnerary(data: dict, flights: str, hotels: str):
+    """
+    Async generator: streams the itinerary text token-by-token,
+    then appends a hidden <!--LOCATIONS_JSON:...--> comment for the map.
+    """
     src    = data.get("source", "")
     dst    = data.get("destination", "")
     dep    = data.get("departure_date", "")
@@ -1677,8 +2000,8 @@ The user's total budget is **{budget}**. Throughout this itinerary:
 - Include a realistic budget breakdown showing how the {budget} is allocated.
 """
 
-    # ── Step 1: get real, geocoded coordinates for hotel + attractions ────────
-    locations = _get_locations_json(dst, hotels, days)
+    # Step 1: geocode — runs concurrently with nothing else (needs LLM first)
+    locations = await _get_locations_json(dst, hotels, days)
 
     place_names_hint = ""
     if locations:
@@ -1688,7 +2011,7 @@ The user's total budget is **{budget}**. Throughout this itinerary:
             f"use these EXACT names so they match the map: {names}\n"
         )
 
-    # ── Step 2: build the itinerary text ─────────────────────────────────────
+    # Step 2: stream itinerary text
     prompt = f"""You are a warm, expert travel planner. Write a complete, detailed travel itinerary in Markdown.
 Be specific, practical, and conversational — like a knowledgeable friend planning this trip for someone.
 Never skip any day. Never say "etc" or "and so on".
@@ -1793,10 +2116,10 @@ What weather to expect in {dst} from {dep} to {ret}.
 Specific packing list for this trip.
 """
 
-    for token in _stream_generate(prompt):
+    async for token in _stream_generate(prompt):
         yield token
 
-    # ── Step 3: append hidden JSON tag for the frontend map ──────────────────
+    # Step 3: append hidden JSON tag for the frontend map
     if locations:
         json_str = json.dumps(locations, ensure_ascii=False)
         yield f"\n\n<!--LOCATIONS_JSON:{json_str}-->"
