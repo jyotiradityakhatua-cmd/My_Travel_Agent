@@ -10,8 +10,8 @@ from app.tools.search_flight import search_flight
 from app.tools.search_hotel import search_hotel
 from app.tools.build_itnerary import build_itnerary
 
-from llm_client import generate_full as _llm_generate_full, stream_generate as _llm_stream_generate
-from system_prompt import build_system_prompt
+from app.llm.llm_client import generate_full as _llm_generate_full, stream_generate as _llm_stream_generate
+from app.llm.prompt import build_system_prompt
 
 load_dotenv()
 
