@@ -8,3 +8,4 @@ serpapi==0.1.5
 langgraph==0.0.25
 pydantic==2.5.0
 pydantic-settings==2.1.0
+aiosqlite
