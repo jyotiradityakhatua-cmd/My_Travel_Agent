@@ -28,14 +28,47 @@
 # Base.metadata.create_all(bind=engine)
 
 # from fastapi import FastAPI
-from app.api.router import api_router
-from app.routes.chat import router as chat_router
+# from app.api.router import api_router
+# from app.routes.chat import router as chat_router
+# from fastapi import FastAPI
+# from fastapi.middleware.cors import CORSMiddleware
+# from app.db.init_db import init_db
+
+# init_db()
+# app = FastAPI()
+
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=["*"],
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
+
+# app.include_router(api_router)
+# app.include_router(chat_router, prefix="/chat")  # ← ADD THIS
+
+
+
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+from app.api.router import api_router
+from app.routes.chat import router as chat_router
 from app.db.init_db import init_db
 
-init_db()
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Run startup tasks (DB init) before the server starts accepting requests."""
+    init_db()          # sync SQLite init — runs once at startup
+    yield
+    # add any shutdown cleanup here if needed
+
+
+app = FastAPI(title="AI Travel Agent", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -46,4 +79,4 @@ app.add_middleware(
 )
 
 app.include_router(api_router)
-app.include_router(chat_router, prefix="/chat")  # ← ADD THIS
+app.include_router(chat_router, prefix="/chat")
