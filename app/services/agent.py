@@ -2,8 +2,8 @@ import json
 import re
 from datetime import datetime
 from dotenv import load_dotenv
-import os
-import requests
+import asyncio
+import httpx
 
 from app.db.chat_repo import get_chat_history
 from app.tools.search_flight import search_flight
@@ -26,6 +26,11 @@ NOMINATIM_HEADERS = {"User-Agent": "ai-travel-agent/1.0"}
 # bearing on the LLM's decisions, which are made with zero Python checks.
 _GEOCODE_CACHE: dict = {}
 
+# Semaphore to enforce Nominatim's 1 req/sec rate limit without blocking
+# the event loop (replaces the threading.Lock + time.sleep approach)
+_GEOCODE_SEMAPHORE = asyncio.Semaphore(1)
+_LAST_GEOCODE_TIME: float = 0.0
+
 
 # ── EVERYTHING about field extraction, date validation, budget parsing, and
 # workflow state is handled ENTIRELY by the LLM via system_prompt.py. There
@@ -39,21 +44,23 @@ _GEOCODE_CACHE: dict = {}
 # re-validates a date, and never overrides a tool-call decision.
 
 
-def _stream_generate(prompt: str):
-    """Streaming single-prompt completion, backed by Groq."""
-    yield from _llm_stream_generate(prompt)
+async def _stream_generate(prompt: str):
+    """Async streaming single-prompt completion, backed by Groq."""
+    async for token in _llm_stream_generate(prompt):
+        yield token
 
 
-def _stream_chat(messages: list):
-    """Streaming multi-turn chat completion, backed by Groq."""
-    yield from _llm_stream_generate(messages)
+async def _stream_chat(messages: list):
+    """Async streaming multi-turn chat completion, backed by Groq."""
+    async for token in _llm_stream_generate(messages):
+        yield token
 
 
-def _llm_decide(messages: list) -> str:
+async def _llm_decide(messages: list) -> str:
     """Non-streaming multi-turn chat completion — the single decision call
     that drives the entire workflow. Whatever this returns IS the decision;
     nothing in Python second-guesses it."""
-    return _llm_generate_full(messages)
+    return await _llm_generate_full(messages)
 
 
 def _extract_all_tools(text: str) -> list:
@@ -92,7 +99,7 @@ def _extract_all_tools(text: str) -> list:
     return []
 
 
-def _force_retry(messages: list, original: str) -> list:
+async def _force_retry(messages: list, original: str) -> list:
     """If the LLM's output couldn't be parsed as JSON at all, ask it once
     more to reformat — still not a content/decision override, purely a
     formatting nudge."""
@@ -105,7 +112,7 @@ def _force_retry(messages: list, original: str) -> list:
             "Output only the JSON, nothing else."
         }
     ]
-    content = _llm_generate_full(retry)
+    content = await _llm_generate_full(retry)
     return _extract_all_tools(content)
 
 
@@ -135,7 +142,8 @@ def _build_messages(history_rows, new_message: str) -> list:
     return msgs
 
 
-def _stream_text(text: str):
+async def _stream_text(text: str):
+    """Async version of character-by-character text streaming."""
     for ch in text:
         yield ch
 
@@ -146,7 +154,7 @@ def _budget_line(budget: str) -> str:
     return ""
 
 
-def _emit_locations(locations: list):
+async def _emit_locations(locations: list):
     """Yield a single LOCATIONS_JSON marker comment if there's anything to
     show. Called exactly once per turn, after all tool calls in that turn
     have finished collecting locations — see _dedupe_add and travel_agent."""
@@ -170,35 +178,52 @@ def _dedupe_add(collected_locations: list, new_locations: list):
             existing_coords.add(key)
 
 
-def _geocode(query: str):
-    """Geocode via Nominatim, with an in-process cache. Returns
-    (lat, lng, display_name) or None. Pure data lookup — not validation."""
+async def _geocode(query: str):
+    """Async geocode via Nominatim with in-process cache and 1 req/sec rate
+    limit enforced by a semaphore + asyncio.sleep (no thread blocking).
+    Returns (lat, lng, display_name) or None. Pure data lookup — not validation."""
+    global _LAST_GEOCODE_TIME
+
     key = query.strip().lower()
     if key in _GEOCODE_CACHE:
         return _GEOCODE_CACHE[key]
-    try:
-        r = requests.get(
-            NOMINATIM_URL,
-            params={"q": query, "format": "json", "limit": 1},
-            headers=NOMINATIM_HEADERS,
-            timeout=10,
-        )
-        r.raise_for_status()
-        data = r.json()
-        if data:
-            result = (float(data[0]["lat"]), float(data[0]["lon"]), data[0].get("display_name", query))
-            _GEOCODE_CACHE[key] = result
-            return result
-        else:
-            print(f"[GEOCODE] no results for '{query}'")
-    except Exception as e:
-        print(f"[GEOCODE] failed for '{query}': {e}")
+
+    async with _GEOCODE_SEMAPHORE:
+        # Re-check cache in case another coroutine filled it while we waited
+        if key in _GEOCODE_CACHE:
+            return _GEOCODE_CACHE[key]
+
+        now = asyncio.get_event_loop().time()
+        wait = _LAST_GEOCODE_TIME + 1.1 - now
+        if wait > 0:
+            await asyncio.sleep(wait)
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(
+                    NOMINATIM_URL,
+                    params={"q": query, "format": "json", "limit": 1},
+                    headers=NOMINATIM_HEADERS,
+                )
+                r.raise_for_status()
+                data = r.json()
+            _LAST_GEOCODE_TIME = asyncio.get_event_loop().time()
+            if data:
+                result = (float(data[0]["lat"]), float(data[0]["lon"]), data[0].get("display_name", query))
+                _GEOCODE_CACHE[key] = result
+                return result
+            else:
+                print(f"[GEOCODE] no results for '{query}'")
+        except Exception as e:
+            print(f"[GEOCODE] failed for '{query}': {e}")
+            _LAST_GEOCODE_TIME = asyncio.get_event_loop().time()
+
     _GEOCODE_CACHE[key] = None
     return None
 
 
-def _geocode_city_marker(city: str, label: str, marker_type: str):
-    geo = _geocode(city)
+async def _geocode_city_marker(city: str, label: str, marker_type: str):
+    geo = await _geocode(city)
     if not geo:
         return None
     lat, lng, display = geo
@@ -232,37 +257,22 @@ def _extract_hotel_names(raw_hotel_text: str) -> list:
     return names
 
 
-def _geocode_named_places(dst: str, names: list, marker_type: str, query_suffix: str = "") -> list:
-    import time
-    from concurrent.futures import ThreadPoolExecutor
-    from threading import Lock
-
+async def _geocode_named_places(dst: str, names: list, marker_type: str, query_suffix: str = "") -> list:
+    """Async version of _geocode_named_places.
+    Geocodes all names concurrently — the semaphore inside _geocode
+    already ensures Nominatim's 1 req/sec limit is respected, so there is
+    no need for a separate ThreadPoolExecutor or time.sleep here."""
     if not names:
         return []
 
-    anchor = _geocode(dst)
+    anchor = await _geocode(dst)
     anchor_lat, anchor_lng = (anchor[0], anchor[1]) if anchor else (None, None)
 
-    _rate_lock = Lock()
-    _last_call = {"t": 0.0}
-
-    def _rate_limited_geocode(q: str):
-        key = q.strip().lower()
-        if key in _GEOCODE_CACHE:
-            return _GEOCODE_CACHE[key]
-        with _rate_lock:
-            wait = _last_call["t"] + 1.1 - time.time()
-            if wait > 0:
-                time.sleep(wait)
-            result = _geocode(q)
-            _last_call["t"] = time.time()
-            return result
-
-    def _resolve(name: str):
+    async def _resolve(name: str):
         primary_q = f"{query_suffix} {name}, {dst}".strip() if query_suffix else f"{name}, {dst}"
-        geo = _rate_limited_geocode(primary_q)
+        geo = await _geocode(primary_q)
         if not geo and query_suffix:
-            geo = _rate_limited_geocode(f"{name}, {dst}")
+            geo = await _geocode(f"{name}, {dst}")
         if not geo:
             return None
         lat, lng, display = geo
@@ -273,20 +283,21 @@ def _geocode_named_places(dst: str, names: list, marker_type: str, query_suffix:
                 return None
         return {"name": name, "type": marker_type, "lat": lat, "lng": lng, "address": display}
 
+    results = await asyncio.gather(*[_resolve(name) for name in names])
+
     locations = []
     seen_coords = set()
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        for result in ex.map(_resolve, names):
-            if result:
-                coord_key = (round(result["lat"], 4), round(result["lng"], 4))
-                if coord_key in seen_coords:
-                    continue
-                seen_coords.add(coord_key)
-                locations.append(result)
+    for result in results:
+        if result:
+            coord_key = (round(result["lat"], 4), round(result["lng"], 4))
+            if coord_key in seen_coords:
+                continue
+            seen_coords.add(coord_key)
+            locations.append(result)
     return locations
 
 
-def _run_tool(tool_call: dict, collected_locations: list):
+async def _run_tool(tool_call: dict, collected_locations: list):
     """
     Executes exactly one tool call already decided by the LLM. Every field
     used here (source, destination, departure_date, return_date, budget,
@@ -297,7 +308,8 @@ def _run_tool(tool_call: dict, collected_locations: list):
     tool = tool_call.get("tool")
 
     if tool == "chat":
-        yield from _stream_text(tool_call.get("message", ""))
+        async for ch in _stream_text(tool_call.get("message", "")):
+            yield ch
         return
 
     if tool == "search_flights":
@@ -307,15 +319,16 @@ def _run_tool(tool_call: dict, collected_locations: list):
         ret    = tool_call.get("return_date", "") or ""
         budget = tool_call.get("budget", "") or ""
 
-        yield from _stream_text(f"Searching flights from **{src}** to **{dst}** on {dep}... ✈️\n\n")
+        async for ch in _stream_text(f"Searching flights from **{src}** to **{dst}** on {dep}... ✈️\n\n"):
+            yield ch
 
         try:
-            raw = search_flight(src, dst, dep, ret, budget)
+            raw = await search_flight(src, dst, dep, ret, budget)
         except Exception as e:
             yield f"Sorry, couldn't fetch flights: {e}"
             return
 
-        yield from _stream_generate(f"""You are a friendly travel assistant. Present these flight results in warm, clear Markdown.
+        async for token in _stream_generate(f"""You are a friendly travel assistant. Present these flight results in warm, clear Markdown.
 {_budget_line(budget)}
 Route: {src} → {dst}
 {f"Departure: {dep} | Return: {ret}" if ret else f"Departure: {dep} (one-way)"}
@@ -351,12 +364,13 @@ Rules:
 - The tables are mandatory — never fall back to a bullet list or inline pipe text.
 - Keep cell values short (no extra emoji inside table cells).
 - Be warm and conversational only in the intro sentence and the Best Pick line, not inside the table.
-""")
+"""):
+            yield token
 
         try:
             new_locs = []
-            origin_marker = _geocode_city_marker(src, src, "origin")
-            dest_marker = _geocode_city_marker(dst, dst, "destination")
+            origin_marker = await _geocode_city_marker(src, src, "origin")
+            dest_marker = await _geocode_city_marker(dst, dst, "destination")
             if origin_marker:
                 new_locs.append(origin_marker)
             if dest_marker:
@@ -379,10 +393,11 @@ Rules:
         except Exception:
             nights = 1
 
-        yield from _stream_text(f"Searching hotels in **{dst}** ({check_in} → {check_out})... 🏨\n\n")
+        async for ch in _stream_text(f"Searching hotels in **{dst}** ({check_in} → {check_out})... 🏨\n\n"):
+            yield ch
 
         try:
-            raw = search_hotel(dst, check_in, check_out, budget)
+            raw = await search_hotel(dst, check_in, check_out, budget)
         except Exception as e:
             yield f"Sorry, couldn't fetch hotels: {e}"
             return
@@ -392,7 +407,7 @@ Rules:
         # the visible chat — same pattern used for the itinerary tool below.
         HOLD_BACK = 200
         pending = ""
-        for chunk in _stream_generate(f"""You are a friendly travel assistant. Present these hotel options in warm, clear Markdown.
+        async for chunk in _stream_generate(f"""You are a friendly travel assistant. Present these hotel options in warm, clear Markdown.
 {_budget_line(budget)}
 Destination: {dst} | {check_in} – {check_out} | {nights} nights
 
@@ -471,8 +486,8 @@ This marker line is required even though it won't be shown to the user — never
             hotel_names = _extract_hotel_names(raw)
 
         try:
-            hotel_locs = _geocode_named_places(dst, hotel_names, marker_type="hotel", query_suffix="hotel")
-            dest_marker = _geocode_city_marker(dst, dst, "destination")
+            hotel_locs = await _geocode_named_places(dst, hotel_names, marker_type="hotel", query_suffix="hotel")
+            dest_marker = await _geocode_city_marker(dst, dst, "destination")
             new_locs = list(hotel_locs)
             if dest_marker and not any(
                 abs(loc["lat"] - dest_marker["lat"]) < 1e-6 and abs(loc["lng"] - dest_marker["lng"]) < 1e-6
@@ -496,19 +511,21 @@ This marker line is required even though it won't be shown to the user — never
         except Exception:
             days = 3
 
-        yield from _stream_text(
+        async for ch in _stream_text(
             f"Let's build your **{days}-day trip** from **{src}** to **{dst}** "
             f"({dep} → {ret})! 🎉 Fetching flights and hotels first...\n\n"
-        )
+        ):
+            yield ch
 
+        # Fetch flights AND hotels concurrently — cuts wait time in half
         try:
-            flights = search_flight(src, dst, dep, ret, budget)
+            flights, hotels = await asyncio.gather(
+                search_flight(src, dst, dep, ret, budget),
+                search_hotel(dst, dep, ret, budget),
+            )
         except Exception as e:
             flights = f"(Flights unavailable: {e})"
-        try:
-            hotels = search_hotel(dst, dep, ret, budget)
-        except Exception as e:
-            hotels = f"(Hotels unavailable: {e})"
+            hotels  = f"(Hotels unavailable: {e})"
 
         # build_itnerary (itinerary.py) already does the right thing here:
         # it makes its OWN dedicated LLM call asking for real place NAMES
@@ -535,7 +552,7 @@ This marker line is required even though it won't be shown to the user — never
         HOLD_BACK = 200  # generous margin over a typical marker's length
         pending = ""
         full_chunks = []
-        for chunk in build_itnerary(
+        async for chunk in build_itnerary(
             {"source": src, "destination": dst,
              "departure_date": dep, "return_date": ret, "days": days, "budget": budget},
             flights, hotels,
@@ -570,8 +587,11 @@ This marker line is required even though it won't be shown to the user — never
 
         try:
             new_locs = []
-            origin_marker = _geocode_city_marker(src, src, "origin")
-            dest_marker = _geocode_city_marker(dst, dst, "destination")
+            # Geocode origin and destination concurrently
+            origin_marker, dest_marker = await asyncio.gather(
+                _geocode_city_marker(src, src, "origin"),
+                _geocode_city_marker(dst, dst, "destination"),
+            )
             if origin_marker:
                 new_locs.append(origin_marker)
             if dest_marker:
@@ -583,7 +603,7 @@ This marker line is required even though it won't be shown to the user — never
         return
 
 
-def travel_agent(chat_id: str, message: str, db):
+async def travel_agent(chat_id: str, message: str, db):
     """
     Single entry point. Every decision in here — whether a field is known,
     whether a date is valid, what to ask next, which tool(s) to call, how
@@ -597,7 +617,7 @@ def travel_agent(chat_id: str, message: str, db):
     print(f"[AGENT] chat={chat_id} history={len(history)}")
 
     try:
-        decision = _llm_decide(messages)
+        decision = await _llm_decide(messages)
     except Exception as e:
         yield f"Sorry, I can't reach the AI model right now. ({e})"
         return
@@ -608,12 +628,12 @@ def travel_agent(chat_id: str, message: str, db):
 
     if not tool_calls:
         print("[AGENT] Parse failed — retrying")
-        tool_calls = _force_retry(messages, decision)
+        tool_calls = await _force_retry(messages, decision)
 
     if not tool_calls:
         print("[AGENT] Retry failed — streaming plain reply")
         try:
-            for token in _stream_chat(messages):
+            async for token in _stream_chat(messages):
                 yield token
         except Exception:
             yield decision
@@ -633,6 +653,8 @@ def travel_agent(chat_id: str, message: str, db):
     for i, tool_call in enumerate(tool_calls):
         if i > 0:
             yield "\n\n---\n\n"
-        yield from _run_tool(tool_call, collected_locations)
+        async for chunk in _run_tool(tool_call, collected_locations):
+            yield chunk
 
-    yield from _emit_locations(collected_locations)
+    async for chunk in _emit_locations(collected_locations):
+        yield chunk
