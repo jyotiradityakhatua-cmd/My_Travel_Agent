@@ -53,3 +53,17 @@ def get_db():
 
     finally:
         db.close()
+
+
+# --- MongoDB client (added for migration from SQLite) ----------------------
+import os
+from pymongo import MongoClient
+
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "travel_agent")
+
+mongo_client = MongoClient(MONGO_URI)
+db = mongo_client[MONGO_DB_NAME]
+
+# `db` is a pymongo.database.Database instance exported for repositories
+# Example usage: from app.db.database import db; db['chat_messages'].insert_one({...})

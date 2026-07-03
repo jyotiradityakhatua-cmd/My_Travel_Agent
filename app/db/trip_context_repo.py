@@ -1,29 +1,25 @@
 from app.db.trip_context import TripContext
-
+from app.db.database import db as mongo_db
+from datetime import datetime
 
 
 
 def get_trip_context(db, chat_id):
-    return (
-        db.query(TripContext)
-        .filter(TripContext.chat_id == chat_id)
-        .first()
-    )
+    return mongo_db.trip_contexts.find_one({"chat_id": chat_id})
 
 
 def create_trip_context(db, chat_id):
-    context = TripContext(chat_id=chat_id)
-
-    db.add(context)
-    db.commit()
-    db.refresh(context)
-
+    context = {
+        "chat_id": chat_id,
+        "created_at": datetime.utcnow(),
+        "data": {}
+    }
+    res = mongo_db.trip_contexts.insert_one(context)
+    context["_id"] = res.inserted_id
     return context
 
 
 def save_trip_context(db, context):
-    db.add(context)
-    db.commit()
-    db.refresh(context)
-
-    return context
+    # Expecting `context` to be a dict containing at least `chat_id`
+    mongo_db.trip_contexts.update_one({"chat_id": context.get("chat_id")}, {"$set": context}, upsert=True)
+    return mongo_db.trip_contexts.find_one({"chat_id": context.get("chat_id")})

@@ -171,3 +171,45 @@ def get_chat_history(db, chat_id: str):
         .order_by(_ChatMessage.id.asc())
         .all()
     )
+
+
+# --- MongoDB-backed helpers (migration from SQLite) -----------------------
+from datetime import datetime
+import asyncio
+from app.db.database import db as mongo_db
+
+
+def _mongo_save_message(chat_id: str, role: str, message: str):
+    doc = {
+        "chat_id": chat_id,
+        "role": role,
+        "message": message,
+        "created_at": datetime.utcnow(),
+    }
+    res = mongo_db.chat_messages.insert_one(doc)
+    doc["_id"] = res.inserted_id
+    return doc
+
+
+def _mongo_get_chat_history(chat_id: str):
+    cursor = mongo_db.chat_messages.find({"chat_id": chat_id}).sort("created_at", 1)
+    return list(cursor)
+
+
+async def async_save_message(db, chat_id: str, role: str, message: str):
+    """Async wrapper that runs the blocking pymongo call in a thread executor."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _mongo_save_message, chat_id, role, message)
+
+
+async def async_get_chat_history(db, chat_id: str):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _mongo_get_chat_history, chat_id)
+
+# Also provide sync mongo helpers for any synchronous codepaths
+def save_message_mongo(chat_id: str, role: str, message: str):
+    return _mongo_save_message(chat_id, role, message)
+
+
+def get_chat_history_mongo(chat_id: str):
+    return _mongo_get_chat_history(chat_id)

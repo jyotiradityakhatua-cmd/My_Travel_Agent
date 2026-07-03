@@ -3,14 +3,20 @@
 # from .chat_state import ChatState
 import app.db.models
 
-
-from app.db.database import Base, engine
-from .chat_state import ChatState
-from app.db.models.user import User
-from app.db.models.chat_session import ChatSession
-from app.db.models.chat_message import ChatMessage
-
+from app.db.database import db
+import pymongo
 
 
 def init_db():
-    Base.metadata.create_all(bind=engine)
+    """Create necessary MongoDB indexes for collections used by the app."""
+    # Users: ensure unique username and user_id
+    db.users.create_index([("user_id", pymongo.ASCENDING)], unique=True)
+    db.users.create_index([("username", pymongo.ASCENDING)], unique=True)
+
+    # Chat sessions
+    db.chat_sessions.create_index([("chat_id", pymongo.ASCENDING)], unique=True)
+
+    # Chat messages: index by chat_id and created_at for efficient history queries
+    db.chat_messages.create_index([("chat_id", pymongo.ASCENDING), ("created_at", pymongo.ASCENDING)])
+
+    return
