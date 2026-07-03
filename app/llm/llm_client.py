@@ -1,8 +1,26 @@
 import json
+import os
 import requests
+from dotenv import find_dotenv, load_dotenv
 
-OLLAMA_URL = "http://localhost:11434"
-MODEL = "llama3"
+load_dotenv(find_dotenv())
+
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+MODEL = os.getenv("OLLAMA_MODEL", "llama3")
+
+
+def _post(path, payload, timeout=120, stream=False):
+    url = f"{OLLAMA_URL}{path}"
+    try:
+        response = requests.post(url, json=payload, timeout=timeout, stream=stream)
+        response.raise_for_status()
+        return response
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(
+            f"Could not reach Ollama at {url}. "
+            "Start the server with `ollama serve` and ensure the model is pulled. "
+            f"Original error: {exc}"
+        ) from exc
 
 
 def generate_full(messages_or_prompt) -> str:
@@ -16,20 +34,18 @@ def generate_full(messages_or_prompt) -> str:
     Returns the full response text.
     """
     if isinstance(messages_or_prompt, str):
-        r = requests.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={"model": MODEL, "prompt": messages_or_prompt, "stream": False},
+        r = _post(
+            "/api/generate",
+            {"model": MODEL, "prompt": messages_or_prompt, "stream": False},
             timeout=120,
         )
-        r.raise_for_status()
         return r.json().get("response", "").strip()
 
-    r = requests.post(
-        f"{OLLAMA_URL}/api/chat",
-        json={"model": MODEL, "messages": messages_or_prompt, "stream": False},
+    r = _post(
+        "/api/chat",
+        {"model": MODEL, "messages": messages_or_prompt, "stream": False},
         timeout=120,
     )
-    r.raise_for_status()
     return r.json()["message"]["content"].strip()
 
 
@@ -40,13 +56,12 @@ def stream_generate(messages_or_prompt):
     Yields text chunks as they arrive.
     """
     if isinstance(messages_or_prompt, str):
-        r = requests.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={"model": MODEL, "prompt": messages_or_prompt, "stream": True},
-            stream=True,
+        r = _post(
+            "/api/generate",
+            {"model": MODEL, "prompt": messages_or_prompt, "stream": True},
             timeout=300,
+            stream=True,
         )
-        r.raise_for_status()
         for line in r.iter_lines(decode_unicode=True):
             if not line:
                 continue
@@ -59,13 +74,12 @@ def stream_generate(messages_or_prompt):
                 continue
         return
 
-    r = requests.post(
-        f"{OLLAMA_URL}/api/chat",
-        json={"model": MODEL, "messages": messages_or_prompt, "stream": True},
-        stream=True,
+    r = _post(
+        "/api/chat",
+        {"model": MODEL, "messages": messages_or_prompt, "stream": True},
         timeout=300,
+        stream=True,
     )
-    r.raise_for_status()
     for line in r.iter_lines(decode_unicode=True):
         if not line:
             continue
