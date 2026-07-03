@@ -29,9 +29,9 @@
 
 # from fastapi import FastAPI
 # from app.api.router import api_router
-# from app.routes.chat import router as chat_router
-# from fastapi import FastAPI
-# from fastapi.middleware.cors import CORSMiddleware
+# from app.api.routes.chat import router as chat_router
+
+
 # from app.db.init_db import init_db
 
 # init_db()
