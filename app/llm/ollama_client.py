@@ -39,13 +39,13 @@ import load_dotenv
 
 load_dotenv()
 
-host = "http://localhost"
-port = 11434
+host = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
+port = os.getenv("OLLAMA_PORT", 11434)
 
 client = httpx.Client(base_url=f"{host}:{port}")
 
 payload = {
-    "model": "OLLAMA_MODEL",
+    "model": os.getenv("OLLAMA_MODEL", "llama3"),
     "messages": [
         {
             "role": "user",
