@@ -62,8 +62,8 @@ from app.db.init_db import init_db
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Run startup tasks (DB init) before the server starts accepting requests."""
-    init_db()          # sync SQLite init — runs once at startup
+    """Run startup tasks (MongoDB init) before the server starts accepting requests."""
+    init_db()          # MongoDB index creation — runs once at startup
     yield
     # add any shutdown cleanup here if needed
 

@@ -57,12 +57,20 @@
 
 # --- MongoDB client (added for migration from SQLite) ----------------------
 import os
+import ssl
 from pymongo import MongoClient
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://jyotir:1234@cluster0.4gj7acf.mongodb.net/")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "travel_agent")
 
-mongo_client = MongoClient(MONGO_URI)
+# For development: disable SSL verification; for production use proper certificates
+mongo_client = MongoClient(
+    MONGO_URI,
+    serverSelectionTimeoutMS=5000,
+    connectTimeoutMS=5000,
+    tlsAllowInvalidCertificates=True,  # Dev only; use proper certs in production
+)
+
 db = mongo_client[MONGO_DB_NAME]
 
 # `db` is a pymongo.database.Database instance exported for repositories
