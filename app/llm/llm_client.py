@@ -1,139 +1,78 @@
-import codecs
 import json
-import os
-import httpx
-from dotenv import load_dotenv
+import requests
 
-load_dotenv()
-
-_raw_key = os.getenv("GROQ_API_KEY") or ""
-# Sanitize common formatting: strip surrounding whitespace and any surrounding quotes
-GROQ_API_KEY = _raw_key.strip().strip('"').strip("'") if _raw_key else None
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+OLLAMA_URL = "http://localhost:11434"
+MODEL = "llama3"
 
 
-def _headers():
-    if not GROQ_API_KEY:
-        raise RuntimeError(
-            "GROQ_API_KEY is not set. Add it to your .env file."
-        )
-    return {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-
-def _to_messages(prompt_or_messages):
+def generate_full(messages_or_prompt) -> str:
     """
+    Non-streaming completion via local Ollama.
+
     Accepts either:
-      - a plain string prompt (wrapped as a single user message), or
-      - a list of {"role": ..., "content": ...} messages (passed through).
-    """
-    if isinstance(prompt_or_messages, str):
-        return [{"role": "user", "content": prompt_or_messages}]
-    return prompt_or_messages
+      - a list of {"role": ..., "content": ...} chat messages -> /api/chat
+      - a plain string prompt -> /api/generate
 
-
-async def generate_full(prompt_or_messages, temperature: float = 0.7, timeout: int = 120) -> str:
+    Returns the full response text.
     """
-    Async non-streaming chat completion. Returns the full response text.
-    Mirrors the old generate_full() behavior.
-    """
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": _to_messages(prompt_or_messages),
-        "temperature": temperature,
-        "stream": False,
-    }
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.post(GROQ_URL, headers=_headers(), json=payload)
+    if isinstance(messages_or_prompt, str):
+        r = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={"model": MODEL, "prompt": messages_or_prompt, "stream": False},
+            timeout=120,
+        )
         r.raise_for_status()
-        data = r.json()
-        return data["choices"][0]["message"]["content"].strip()
+        return r.json().get("response", "").strip()
+
+    r = requests.post(
+        f"{OLLAMA_URL}/api/chat",
+        json={"model": MODEL, "messages": messages_or_prompt, "stream": False},
+        timeout=120,
+    )
+    r.raise_for_status()
+    return r.json()["message"]["content"].strip()
 
 
-async def stream_generate(prompt_or_messages, temperature: float = 0.7, timeout: int = 300):
+def stream_generate(messages_or_prompt):
     """
-    Async streaming chat completion. Async-yields text tokens as they arrive.
-
-    IMPORTANT — encoding handling:
-    SSE bytes arrive in arbitrary network chunks that do NOT respect UTF-8
-    character boundaries or even line boundaries. A multi-byte character
-    (emoji are 4 bytes, ₹ is 3 bytes) can be split so that part of it
-    arrives in one read() and the rest in the next. Decoding each raw
-    chunk/line independently as UTF-8 — or letting the HTTP client guess the
-    encoding — corrupts or silently drops those split characters. This is
-    what caused the mangled/missing text.
-
-    The correct fix is to feed raw bytes through an incremental UTF-8
-    decoder (codecs.getincrementaldecoder) that buffers any partial
-    trailing bytes until the rest of the character arrives, and to do
-    line-splitting AFTER decoding (on the decoded text), not before.
+    Streaming completion via local Ollama. Same dual input support as
+    generate_full (string prompt -> /api/generate, message list -> /api/chat).
+    Yields text chunks as they arrive.
     """
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": _to_messages(prompt_or_messages),
-        "temperature": temperature,
-        "stream": True,
-    }
+    if isinstance(messages_or_prompt, str):
+        r = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={"model": MODEL, "prompt": messages_or_prompt, "stream": True},
+            stream=True,
+            timeout=300,
+        )
+        r.raise_for_status()
+        for line in r.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            try:
+                chunk = json.loads(line)
+                token = chunk.get("response", "")
+                if token:
+                    yield token
+            except Exception:
+                continue
+        return
 
-    decoder = codecs.getincrementaldecoder("utf-8")()
-    line_buffer = ""
-
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        async with client.stream("POST", GROQ_URL, headers=_headers(), json=payload) as r:
-            r.raise_for_status()
-
-            # aiter_bytes yields raw bytes as they arrive from the socket —
-            # no decode_unicode, no line-splitting at the bytes level.
-            async for raw_chunk in r.aiter_bytes():
-                if not raw_chunk:
-                    continue
-
-                # Incrementally decode only as many bytes as form complete
-                # characters; any dangling partial multi-byte sequence is held
-                # internally by the decoder until the next chunk completes it.
-                text_piece = decoder.decode(raw_chunk)
-                if not text_piece:
-                    continue
-
-                line_buffer += text_piece
-
-                # Process any complete lines now sitting in the buffer.
-                while "\n" in line_buffer:
-                    line, line_buffer = line_buffer.split("\n", 1)
-                    line = line.strip()
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data_str = line[len("data:"):].strip()
-                    if data_str == "[DONE]":
-                        return
-                    try:
-                        parsed = json.loads(data_str)
-                        delta = parsed["choices"][0].get("delta", {})
-                        token = delta.get("content", "")
-                        if token:
-                            yield token
-                    except Exception:
-                        continue
-
-            # Flush any trailing bytes held by the incremental decoder (in case
-            # the stream ended exactly on a multi-byte boundary) and process
-            # whatever's left in the line buffer.
-            tail = decoder.decode(b"", final=True)
-            if tail:
-                line_buffer += tail
-            if line_buffer.strip().startswith("data:"):
-                data_str = line_buffer.strip()[len("data:"):].strip()
-                if data_str and data_str != "[DONE]":
-                    try:
-                        parsed = json.loads(data_str)
-                        delta = parsed["choices"][0].get("delta", {})
-                        token = delta.get("content", "")
-                        if token:
-                            yield token
-                    except Exception:
-                        pass
- 
- 
+    r = requests.post(
+        f"{OLLAMA_URL}/api/chat",
+        json={"model": MODEL, "messages": messages_or_prompt, "stream": True},
+        stream=True,
+        timeout=300,
+    )
+    r.raise_for_status()
+    for line in r.iter_lines(decode_unicode=True):
+        if not line:
+            continue
+        try:
+            chunk = json.loads(line)
+            token = chunk.get("message", {}).get("content", "")
+            if token:
+                yield token
+        except Exception:
+            continue

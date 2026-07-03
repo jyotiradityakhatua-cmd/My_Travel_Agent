@@ -1,4 +1,3 @@
-from app.db.trip_context import TripContext
 from app.db.database import db as mongo_db
 from datetime import datetime
 

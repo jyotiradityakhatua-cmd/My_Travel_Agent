@@ -1,9 +1,5 @@
 
-from app.db.database import SessionLocal
+from app.db.database import db as mongo_db
 
 def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+    yield mongo_db

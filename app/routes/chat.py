@@ -1600,18 +1600,18 @@
 
 import uuid
 import os
+import asyncio
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy.orm import Session
 import httpx
 from dotenv import load_dotenv
 
 from app.db.session import get_db
 from app.db.chat_repo import save_message, get_chat_history
-from app.db.models.chat_session import ChatSession
-from app.db.models.user import User
+from app.db.chat_session_repo import get_session, create_session, get_sessions_by_user
+from app.db.user_repo import get_user_by_username, create_user
 from app.services.agent import travel_agent
 
 load_dotenv()
@@ -1622,19 +1622,16 @@ router = APIRouter()
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
 @router.post("/register")
-async def register(username: str, password: str, db: Session = Depends(get_db)):
-    if db.query(User).filter(User.username == username).first():
+async def register(username: str, password: str, db=Depends(get_db)):
+    if get_user_by_username(db, username):
         raise HTTPException(status_code=400, detail="Username already exists")
-    user = User(username=username, password=password)
-    db.add(user)
-    db.commit()
-    db.refresh(user)
+    user = create_user(db, username=username, password=password)
     return {"user_id": user.user_id, "username": user.username}
 
 
 @router.post("/login")
-async def login(username: str, password: str, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.username == username).first()
+async def login(username: str, password: str, db=Depends(get_db)):
+    user = get_user_by_username(db, username)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     if user.password != password:
@@ -1649,22 +1646,23 @@ async def chat(
     message: str,
     user_id: str,
     chat_id: Optional[str] = None,
-    db: Session = Depends(get_db),
+    db=Depends(get_db),
 ):
     if not chat_id:
         chat_id = str(uuid.uuid4())
 
     # Ensure session row exists
-    if not db.query(ChatSession).filter(ChatSession.chat_id == chat_id).first():
-        db.add(ChatSession(chat_id=chat_id, user_id=user_id, title=message[:50]))
-        db.commit()
+    if not get_session(db, chat_id):
+        create_session(db, chat_id=chat_id, user_id=user_id, title=message[:50])
 
     # Persist user message synchronously before streaming starts
     save_message(db=db, chat_id=chat_id, role="user", message=message)
 
     async def stream():
         full = ""
-        async for chunk in travel_agent(chat_id, message, db):
+        # travel_agent is a plain sync generator (yield / yield from), not
+        # an async generator, so this must stay a normal `for`.
+        for chunk in travel_agent(chat_id, message, db):
             full += chunk
             yield chunk
         # Persist assistant reply after stream completes
@@ -1678,29 +1676,32 @@ async def chat(
 # ── History & user chats ──────────────────────────────────────────────────────
 
 @router.get("/history/{chat_id}")
-async def history(chat_id: str, db: Session = Depends(get_db)):
+async def history(chat_id: str, db=Depends(get_db)):
+    # get_chat_history returns plain Mongo dicts (keys: _id, chat_id, role,
+    # message, created_at), not ORM row objects, so access is via ["key"].
     msgs = get_chat_history(db=db, chat_id=chat_id)
     return [
-        {"id": m.id, "role": m.role, "message": m.message, "created_at": m.created_at}
+        {
+            "id": str(m["_id"]),
+            "role": m["role"],
+            "message": m["message"],
+            "created_at": m["created_at"],
+        }
         for m in msgs
     ]
 
 
 @router.get("/users/{user_id}/chats")
-async def get_user_chats(user_id: str, db: Session = Depends(get_db)):
-    chats = (
-        db.query(ChatSession)
-        .filter(ChatSession.user_id == user_id)
-        .order_by(ChatSession.created_at.desc())
-        .all()
-    )
+async def get_user_chats(user_id: str, db=Depends(get_db)):
+    sessions = get_sessions_by_user(db, user_id)
     return [
-        {"chat_id": c.chat_id, "title": c.title, "created_at": c.created_at}
-        for c in chats
+        {"chat_id": s.chat_id, "title": s.title, "created_at": s.created_at}
+        for s in sessions
     ]
 
 
 # ── Places / Hotels (Google Maps via SearchAPI.io) ────────────────────────────
+# No DB involved here -- unchanged.
 
 SEARCHAPI_KEY = os.environ.get("SERP_API_KEY")
 SEARCHAPI_URL = "https://www.searchapi.io/api/v1/search"
@@ -1759,8 +1760,6 @@ async def search_places_batch(
     lng: Optional[float] = Query(None),
 ):
     terms = [t.strip() for t in queries.split(",") if t.strip()][:15]
-    # Run all place searches concurrently
-    import asyncio
     results = await asyncio.gather(
         *[search_places(q=term, lat=lat, lng=lng) for term in terms],
         return_exceptions=True,

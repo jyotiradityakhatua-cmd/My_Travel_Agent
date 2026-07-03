@@ -1808,7 +1808,6 @@ import re
 import math
 import asyncio
 import httpx
-import os
 from dotenv import load_dotenv
 
 from app.llm.llm_client import generate_full as _generate_full, stream_generate as _stream_generate
@@ -1933,7 +1932,12 @@ type must be one of: hotel, attraction, restaurant, transport, other.
 Output ONLY the JSON array now:
 """
     try:
-        raw = await _generate_full(name_prompt)
+        # _generate_full (app.llm.llm_client.generate_full) is a plain sync
+        # function -- it uses `requests`, not an async HTTP client -- so it
+        # must be called directly, never awaited. Awaiting a sync function's
+        # return value (a plain str) raises
+        # "TypeError: object str can't be used in 'await' expression".
+        raw = _generate_full(name_prompt)
         named = _extract_json_array(raw)
     except Exception as e:
         print(f"[ITINERARY] Name list failed: {e}")
@@ -2005,7 +2009,7 @@ The user's total budget is **{budget}**. Throughout this itinerary:
 
     place_names_hint = ""
     if locations:
-        names = ", ".join(f'"{l["name"]}"' for l in locations)
+        names = ", ".join(f'"{loc["name"]}"' for loc in locations)
         place_names_hint = (
             f"\nIMPORTANT: When mentioning the hotel or attractions below, "
             f"use these EXACT names so they match the map: {names}\n"
@@ -2102,7 +2106,7 @@ Practical transport guide covering:
 | Shopping & misc | ₹X,XXX |
 | **Total Estimated** | **₹XX,XXX** |
 {f"| **User Budget** | **{budget}** |" if budget else ""}
-{f"| **Remaining / Over** | ₹ (calculate difference) |" if budget else ""}
+{"| **Remaining / Over** | ₹ (calculate difference) |" if budget else ""}
 
 ---
 
@@ -2116,7 +2120,10 @@ What weather to expect in {dst} from {dep} to {ret}.
 Specific packing list for this trip.
 """
 
-    async for token in _stream_generate(prompt):
+    # _stream_generate (app.llm.llm_client.stream_generate) is a plain sync
+    # generator (uses `requests` with iter_lines), so this must stay a
+    # normal `for`, never `async for`.
+    for token in _stream_generate(prompt):
         yield token
 
     # Step 3: append hidden JSON tag for the frontend map

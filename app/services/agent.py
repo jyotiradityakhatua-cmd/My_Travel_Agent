@@ -1,76 +1,759 @@
 import json
 import re
-from datetime import datetime
+import requests
+import calendar
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
-import asyncio
-import httpx
-
 from app.db.chat_repo import get_chat_history
 from app.tools.search_flight import search_flight
 from app.tools.search_hotel import search_hotel
 from app.tools.build_itnerary import build_itnerary
 
 from app.llm.llm_client import generate_full as _llm_generate_full, stream_generate as _llm_stream_generate
-from app.llm.prompt import build_system_prompt
 
 load_dotenv()
 
 TODAY = datetime.now()
 
+# ── Month lookup ──────────────────────────────────────────────────────────────
+MONTH_MAP = {
+    "jan": ("Jan", 1), "january": ("Jan", 1),
+    "feb": ("Feb", 2), "february": ("Feb", 2),
+    "mar": ("Mar", 3), "march": ("Mar", 3),
+    "apr": ("Apr", 4), "april": ("Apr", 4),
+    "may": ("May", 5),
+    "jun": ("Jun", 6), "june": ("Jun", 6),
+    "jul": ("Jul", 7), "july": ("Jul", 7),
+    "aug": ("Aug", 8), "august": ("Aug", 8),
+    "sep": ("Sep", 9), "sept": ("Sep", 9), "september": ("Sep", 9),
+    "oct": ("Oct", 10), "october": ("Oct", 10),
+    "nov": ("Nov", 11), "november": ("Nov", 11),
+    "dec": ("Dec", 12), "december": ("Dec", 12),
+}
+
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 NOMINATIM_HEADERS = {"User-Agent": "ai-travel-agent/1.0"}
 
-# Simple process-lifetime geocode cache — purely a performance optimization
-# (avoids re-hitting Nominatim for the same place name across calls in the
-# same turn or across turns). This is NOT validation of any kind; it has no
-# bearing on the LLM's decisions, which are made with zero Python checks.
-_GEOCODE_CACHE: dict = {}
-
-# Semaphore to enforce Nominatim's 1 req/sec rate limit without blocking
-# the event loop (replaces the threading.Lock + time.sleep approach)
-_GEOCODE_SEMAPHORE = asyncio.Semaphore(1)
-_LAST_GEOCODE_TIME: float = 0.0
+# Simple process-lifetime geocode cache so repeated lookups (same city/hotel
+# across turns or across hotel + flight + itinerary calls) don't re-hit
+# Nominatim and don't re-pay the 1s rate-limit sleep.
+_GEOCODE_CACHE: dict[str, tuple] = {}
 
 
-# ── EVERYTHING about field extraction, date validation, budget parsing, and
-# workflow state is handled ENTIRELY by the LLM via system_prompt.py. There
-# is intentionally no Python regex, no date math, and no field-tracking
-# state object anywhere in this file. Python's only jobs are:
-#   1. Hand the LLM today's real date + the full chat history.
-#   2. Parse whatever JSON tool-call(s) the LLM decides on.
-#   3. Execute those tool calls (call the search/build functions, geocode
-#      results for the map, stream the presentation text back).
-# Python never re-asks a question the LLM already answered, never
-# re-validates a date, and never overrides a tool-call decision.
+# ── Date helpers ──────────────────────────────────────────────────────────────
+
+def _parse_date_token(day_s: str, mon_key: str, yr_s: str | None) -> datetime | None:
+    """Try to turn raw day/month/year strings into a datetime. Returns None on failure."""
+    if mon_key not in MONTH_MAP:
+        return None
+    _, mon_num = MONTH_MAP[mon_key]
+    try:
+        day = int(day_s)
+    except Exception:
+        return None
+    if day <= 0:
+        return None
+
+    if yr_s:
+        year = int(yr_s)
+    else:
+        year = None
+        for yr in [TODAY.year, TODAY.year + 1]:
+            max_d = calendar.monthrange(yr, mon_num)[1]
+            if day > max_d:
+                return None
+            try:
+                dt = datetime(yr, mon_num, day)
+                if dt.date() >= TODAY.date():
+                    year = yr
+                    break
+            except Exception:
+                pass
+        if year is None:
+            return None
+
+    max_days = calendar.monthrange(year, mon_num)[1]
+    if day > max_days:
+        return None
+    try:
+        return datetime(year, mon_num, day)
+    except Exception:
+        return None
 
 
-async def _stream_generate(prompt: str):
-    """Async streaming single-prompt completion, backed by Groq."""
-    async for token in _llm_stream_generate(prompt):
-        yield token
+def _extract_dates_from_text(text: str) -> list[datetime]:
+    """Return all valid future datetimes found in text, in order."""
+    low = text.lower()
+    date_re = (
+        r"\b(-?\d{1,2})(?:st|nd|rd|th)?\s+"
+        r"(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*"
+        r"(?:\s+(\d{4}))?\b"
+        r"|\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*"
+        r"\s+(-?\d{1,2})(?:st|nd|rd|th)?(?:\s+(\d{4}))?\b"
+    )
+    found = []
+    for m in re.finditer(date_re, low):
+        g = m.groups()
+        if g[0] is not None:
+            day_s, mon_key, yr_s = g[0], g[1], g[2]
+        else:
+            mon_key, day_s, yr_s = g[3], g[4], g[5]
+        dt = _parse_date_token(day_s, mon_key, yr_s)
+        if dt:
+            found.append(dt)
+    return found
 
 
-async def _stream_chat(messages: list):
-    """Async streaming multi-turn chat completion, backed by Groq."""
-    async for token in _llm_stream_generate(messages):
-        yield token
+def _validate_dates_in_message(message: str):
+    """
+    Validate dates in the user message.
+    Returns (valid_flag, error_message | None).
+    """
+    low = message.lower()
+    _, mon_num_dummy = MONTH_MAP.get("jan", ("Jan", 1))
+
+    date_re = (
+        r"\b(-?\d{1,2})(?:st|nd|rd|th)?\s+"
+        r"(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*"
+        r"(?:\s+(\d{4}))?\b"
+        r"|\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*"
+        r"\s+(-?\d{1,2})(?:st|nd|rd|th)?(?:\s+(\d{4}))?\b"
+    )
+
+    for m in re.finditer(date_re, low):
+        g = m.groups()
+        if g[0] is not None:
+            day_s, mon_key, yr_s = g[0], g[1], g[2]
+        else:
+            mon_key, day_s, yr_s = g[3], g[4], g[5]
+
+        if mon_key not in MONTH_MAP:
+            continue
+        mon_label, mon_num = MONTH_MAP[mon_key]
+
+        try:
+            day = int(day_s)
+        except Exception:
+            continue
+
+        if day <= 0:
+            return False, (
+                f"⚠️ **{day_s} {mon_label}** is not a valid date. "
+                f"Day must be between 1 and {calendar.monthrange(TODAY.year, mon_num)[1]}. "
+                f"Please enter a valid date."
+            )
+
+        if yr_s:
+            year = int(yr_s)
+        else:
+            year = None
+            for yr in [TODAY.year, TODAY.year + 1]:
+                max_d = calendar.monthrange(yr, mon_num)[1]
+                if day > max_d:
+                    return False, (
+                        f"⚠️ **{day} {mon_label}** is not a valid date — "
+                        f"{mon_label} only has {max_d} days. "
+                        f"Did you mean **{max_d} {mon_label}**?"
+                    )
+                try:
+                    dt = datetime(yr, mon_num, day)
+                    if dt.date() >= TODAY.date():
+                        year = yr
+                        break
+                except Exception:
+                    pass
+            if year is None:
+                return False, (
+                    f"⚠️ **{day} {mon_label}** has already passed. "
+                    f"Please provide a future date. 📅"
+                )
+
+        max_days = calendar.monthrange(year, mon_num)[1]
+        if day > max_days:
+            return False, (
+                f"⚠️ **{day} {mon_label} {year}** is not valid — "
+                f"{mon_label} {year} only has {max_days} days. "
+                f"Did you mean **{max_days} {mon_label} {year}**?"
+            )
+
+        try:
+            dt = datetime(year, mon_num, day)
+            if dt.date() < TODAY.date():
+                return False, (
+                    f"⚠️ **{day} {mon_label} {year}** has already passed. "
+                    f"Today is {TODAY.strftime('%-d %b %Y')}. Please provide a future date. 📅"
+                )
+        except Exception:
+            return False, f"⚠️ **{day_s} {mon_key}** is not a valid date."
+
+    return True, None
 
 
-async def _llm_decide(messages: list) -> str:
-    """Non-streaming multi-turn chat completion — the single decision call
-    that drives the entire workflow. Whatever this returns IS the decision;
-    nothing in Python second-guesses it."""
-    return await _llm_generate_full(messages)
+def _fmt(dt: datetime) -> str:
+    return dt.strftime("%-d %b %Y")
+
+
+def _is_budget_question(text: str) -> bool:
+    """True if an assistant message was asking the budget question."""
+    low = (text or "").lower()
+    return "budget" in low and ("mind" in low or "skip" in low or "₹" in low or "rs" in low)
+
+
+def _rebuild_known_fields(history_rows) -> dict:
+    """
+    Scan ALL prior user messages to extract:
+      - source, destination  (from city patterns)
+      - departure_date, return_date  (from date patterns)
+      - budget  (from currency / number patterns, or skip replies)
+    Returns a dict with whatever was found (None for missing).
+
+    history_rows are plain dicts (as returned by Mongo via chat_repo /
+    get_chat_history), so every field is accessed via row["role"] /
+    row["message"] rather than attribute access.
+
+    Budget skip-detection ("no" / "nope" / "skip" / "none" / etc.) is
+    context-aware: a bare word like "no" only counts as "user skipped the
+    budget" when it's a direct reply to the assistant having just asked the
+    budget question. This avoids two failure modes seen in practice:
+      1. A bare "no" never matching at all (old regex required "no budget"
+         literally), so the skip silently failed to register and the
+         budget question kept repeating forever.
+      2. A "no" said for an unrelated reason elsewhere in the conversation
+         being misread as a budget skip.
+    """
+    state = {
+        "source": None,
+        "destination": None,
+        "departure_date": None,
+        "return_date": None,
+        "budget": None,
+    }
+
+    prev_assistant_msg = ""
+
+    for row in history_rows:
+        role = row["role"]
+        message = row["message"]
+
+        if role != "user":
+            prev_assistant_msg = message if role == "assistant" else prev_assistant_msg
+            continue
+        msg = message
+        low = msg.lower().strip()
+        replying_to_budget_question = _is_budget_question(prev_assistant_msg)
+
+        # ── cities ────────────────────────────────────────────────────────────
+        ft = re.search(
+            r"\bfrom\s+([a-zA-Z][a-zA-Z ]{0,25}?)\s+to\s+([a-zA-Z][a-zA-Z ]{0,25}?)"
+            r"(?=\s+on\b|\s+\d|\s*[,.]|\s*$)", low
+        )
+        if ft:
+            state["source"]      = ft.group(1).strip().title()
+            state["destination"] = ft.group(2).strip().title()
+        else:
+            fm = re.search(r"\b(?:from|flying from|departing from)\s+([a-zA-Z ]{2,25}?)(?=\s+to|\s+on|\s*$|,)", low)
+            tm = re.search(r"\b(?:to|going to|fly to|travel to|visiting|heading to)\s+([a-zA-Z ]{2,25}?)(?=\s+on|\s+\d|\s*$|,)", low)
+            if fm:
+                state["source"]      = fm.group(1).strip().title()
+            if tm:
+                state["destination"] = tm.group(1).strip().title()
+            # Debug: show what we saw for city parsing
+            try:
+                print(f"[REBUILD] low='{low}' fm={bool(fm)} tm={bool(tm)} source={state['source']} destination={state['destination']}")
+            except Exception:
+                pass
+            # Bare "X to Y" (e.g. "delhi to goa") — capture both when user omits 'from'
+            if not (state["source"] and state["destination"]):
+                plain = re.search(r"\b([a-zA-Z][a-zA-Z ]{0,25}?)\s+to\s+([a-zA-Z][a-zA-Z ]{0,25}?)\b", low)
+                if plain:
+                    src = plain.group(1).strip().title()
+                    dst = plain.group(2).strip().title()
+                    if not state["source"]:
+                        state["source"] = src
+                    if not state["destination"]:
+                        state["destination"] = dst
+                else:
+                    # Fallback: simple split on ' to ' for short place-like replies
+                    if " to " in low:
+                        left, right = low.split(" to ", 1)
+                        left = left.strip()
+                        right = right.strip()
+                        if left and right:
+                            # Heuristic: accept when both sides are short (<=3 words)
+                            if len(left.split()) <= 3 and len(right.split()) <= 4:
+                                # Avoid cases where left is a verb phrase like 'i want'
+                                if not re.search(r"\b(i|i'm|i am|want|would|like|planning|please|show|give)\b", left):
+                                    if not state["source"]:
+                                        state["source"] = left.title()
+                                    if not state["destination"]:
+                                        state["destination"] = right.title()
+                                    try:
+                                        print(f"[REBUILD-FALLBACK] left='{left}' right='{right}' -> source={state['source']} destination={state['destination']}")
+                                    except Exception:
+                                        pass
+
+        # ── dates ─────────────────────────────────────────────────────────────
+        dates = _extract_dates_from_text(msg)
+
+        if len(dates) >= 2:
+            # Two dates found → first is departure, second is return
+            if state["departure_date"] is None:
+                state["departure_date"] = _fmt(dates[0])
+            if state["return_date"] is None:
+                state["return_date"] = _fmt(dates[1])
+        elif len(dates) == 1:
+            # One date: if departure already known treat as return, else departure
+            if state["departure_date"] is None:
+                state["departure_date"] = _fmt(dates[0])
+            elif state["return_date"] is None:
+                state["return_date"] = _fmt(dates[0])
+
+        # ── days duration ─────────────────────────────────────────────────────
+        days_m = re.search(r"\b(\d+)\s*days?\b", low)
+        if days_m and state["departure_date"] and state["return_date"] is None:
+            n = int(days_m.group(1))
+            dep_dt = None
+            for fmt in ["%d %b %Y"]:
+                try:
+                    dep_dt = datetime.strptime(state["departure_date"], fmt)
+                    break
+                except Exception:
+                    pass
+            if dep_dt:
+                state["return_date"] = _fmt(dep_dt + timedelta(days=n))
+
+        # ── budget: explicit skip ─────────────────────────────────────────────
+        # Bare skip words ("no", "nope", "none", "nah") only count when
+        # directly replying to the budget question. Phrases that are
+        # unambiguous regardless of context ("skip", "no budget",
+        # "flexible", "any budget", "no limit") always count.
+        unambiguous_skip = re.search(
+            r"\b(skip|no budget|any budget|flexible|no limit|don'?t have a budget)\b", low
+        )
+        bare_skip_reply = replying_to_budget_question and re.fullmatch(
+            r"(no|nope|nah|none|n/a|na)[.!]?", low
+        )
+        if state["budget"] is None and (unambiguous_skip or bare_skip_reply):
+            state["budget"] = ""   # empty string = explicitly skipped
+
+        # ── budget: explicit amount ──────────────────────────────────────────
+        # Three ways an amount can show up:
+        #   1. Keyword-prefixed: "budget is 15000", "₹15,000", "15000 rs"
+        #   2. Natural phrasing anywhere in the sentence: "i have 15000",
+        #      "i've got 15k", "with a budget of 15000", "around 15000"
+        #   3. A bare-number reply when budget is still unknown (the whole
+        #      message, after stripping spaces/commas, is just digits) —
+        #      i.e. answering "what's your budget?" with just "25000".
+        # All three exclude numbers already consumed as dates/day-counts
+        # above by requiring >= 1000 (calendar days/months never reach that).
+        if state["budget"] is None:
+            raw_num = None
+
+            keyword_m = re.search(
+                r"(?:budget(?:\s+is|\s+of)?|rs\.?|₹|inr)\s*([\d][\d,\s]*\d)\s*(?:rs\.?|₹|inr|rupees?|k\b)?",
+                low
+            )
+            natural_m = re.search(
+                r"\b(?:i\s*(?:have|'ve got|got|can spend)|with|around|about|approx(?:imately)?|"
+                r"have)\s+(?:a\s+budget\s+of\s+)?(?:₹|rs\.?|inr)?\s*([\d][\d,\s]*\d)\b"
+                r"\s*(?:rs\.?|₹|inr|rupees?|k\b)?",
+                low
+            )
+            bare_number_m = re.fullmatch(r"\s*([\d][\d,\s]*\d)\s*(?:rs\.?|₹|inr|rupees?|k)?\s*", low)
+
+            if keyword_m:
+                raw_num = keyword_m.group(1)
+            elif natural_m:
+                raw_num = natural_m.group(1)
+            elif bare_number_m:
+                raw_num = bare_number_m.group(1)
+
+            if raw_num:
+                cleaned = raw_num.replace(",", "").replace(" ", "")
+                if cleaned.isdigit() and int(cleaned) >= 1000:
+                    state["budget"] = f"₹{int(cleaned):,}"
+
+        prev_assistant_msg = ""  # consumed; reset until next assistant turn
+
+    return state
+
+
+# ── Missing-field guardrail ─────────────────────────────────────────────────
+# Single source of truth for "what's the next thing we need from the user".
+# Both the system prompt AND the post-hoc guardrail use this so they can
+# never disagree with each other.
+
+REQUIRED_FIELD_QUESTIONS = {
+    "source_destination": "Where are you flying from and to? 🌍",
+    "departure_date": "When are you planning to depart? 📅",
+    "return_date": "What's your return date? Or how many days are you staying? 🗓️",
+    "budget": "Do you have a total budget in mind? 💰 (e.g. ₹25,000 — or say 'skip' to see all options)",
+}
+
+
+def _next_missing_field(known: dict) -> str | None:
+    """Returns the key of the first missing required field, or None if all collected."""
+    if not known.get("source") or not known.get("destination"):
+        return "source_destination"
+    if not known.get("departure_date"):
+        return "departure_date"
+    if not known.get("return_date"):
+        return "return_date"
+    if known.get("budget") is None:
+        return "budget"
+    return None
+
+
+def _enforce_missing_field(tool_calls: list, known: dict) -> list:
+    """
+    Hard safety net: while ANY required field is still missing, the ONLY
+    thing allowed to reach the user is the exact question for that field —
+    no matter what the LLM produced.
+
+    This is intentionally unconditional, not limited to real search/build
+    tool calls. Earlier versions only blocked premature search_flights /
+    search_hotels / build_itinerary calls, but a model can just as easily
+    fabricate a "chat" message that *claims* every field is collected
+    (e.g. inventing a same-day return and printing a trip summary) without
+    ever calling a search tool. That fabricated chat message is just as
+    wrong as a premature tool call, so it must be blocked the same way.
+
+    Once _next_missing_field(known) returns None (everything genuinely
+    collected per Python's own extraction), the LLM's output passes through
+    untouched — this only restricts the "still missing something" phase.
+    """
+    missing = _next_missing_field(known)
+    if missing is None:
+        return tool_calls  # everything collected — let the LLM's call(s) through
+
+    return [{"tool": "chat", "message": REQUIRED_FIELD_QUESTIONS[missing]}]
+
+
+def _build_system(known: dict | None = None) -> str:
+    today = TODAY.strftime("%d %b %Y")
+    k = known or {}
+
+    src   = k.get("source")       or "NOT YET PROVIDED"
+    dst   = k.get("destination")  or "NOT YET PROVIDED"
+    dep   = k.get("departure_date") or "NOT YET PROVIDED"
+    ret   = k.get("return_date")  or "NOT YET PROVIDED"
+    bud   = k.get("budget")       # None = not asked yet; "" = skipped; "₹X" = given
+
+    budget_display = "NOT YET ASKED" if bud is None else ("Flexible (skipped)" if bud == "" else bud)
+
+    missing = _next_missing_field(k)
+    if missing is None:
+        next_field_line = "ALL FIELDS COLLECTED — show the trip summary now."
+    else:
+        next_field_line = f'"{missing}" — you MUST ask exactly this: {REQUIRED_FIELD_QUESTIONS[missing]}'
+
+    return f"""You are a friendly AI travel assistant. CURRENT DATE is {today}.
+You MUST always respond with ONLY a JSON object — never plain text, never explanation.
+
+═══════════════════════════════════════════════════════
+ALREADY COLLECTED (Python extracted — DO NOT ask again for these)
+═══════════════════════════════════════════════════════
+source         = {src}
+destination    = {dst}
+departure_date = {dep}
+return_date    = {ret}
+budget         = {budget_display}
+
+═══════════════════════════════════════════════════════
+NEXT REQUIRED FIELD (computed by Python — this is authoritative)
+═══════════════════════════════════════════════════════
+NEXT_MISSING_FIELD = {next_field_line}
+
+If NEXT_MISSING_FIELD names a field, your ONLY valid response is the chat
+message for that field. Do NOT ask about anything else. Do NOT skip ahead to
+flights/hotels/itinerary/budget summary even if the user's last message
+seems to imply it — one field at a time, in order.
+
+═══════════════════════════════════════════════════════
+TOOLS
+═══════════════════════════════════════════════════════
+
+{{"tool":"chat","message":"..."}}
+{{"tool":"search_flights","source":"...","destination":"...","departure_date":"...","return_date":"","budget":""}}
+{{"tool":"search_hotels","destination":"...","check_in":"...","check_out":"...","budget":""}}
+{{"tool":"build_itinerary","source":"...","destination":"...","departure_date":"...","return_date":"...","days":0,"budget":""}}
+
+═══════════════════════════════════════════════════════
+WORKFLOW — follow EXACTLY, one step at a time
+═══════════════════════════════════════════════════════
+
+  • source or destination = "NOT YET PROVIDED"
+    → {{"tool":"chat","message":"Where are you flying from and to? 🌍"}}
+
+  • departure_date = "NOT YET PROVIDED"
+    → {{"tool":"chat","message":"When are you planning to depart? 📅"}}
+
+  • return_date = "NOT YET PROVIDED"
+    → {{"tool":"chat","message":"What's your return date? Or how many days are you staying? 🗓️"}}
+    NOTE: a single date given by the user is the DEPARTURE date only. NEVER
+    assume the trip is a same-day return. Always ask this question
+    explicitly until the user gives a second date or a number of days.
+
+  • budget = "NOT YET ASKED"  (i.e. budget shows "NOT YET ASKED")
+    → {{"tool":"chat","message":"Do you have a total budget in mind? 💰 (e.g. ₹25,000 — or say 'skip' to see all options)"}}
+
+  • ALL fields collected (nothing shows "NOT YET PROVIDED" or "NOT YET ASKED")
+    → Show summary and ask what they want:
+    {{"tool":"chat","message":"Perfect! 🎉 Here's your trip:\\n✅ {src} → {dst}\\n📅 {dep} → {ret}\\n💰 Budget: {budget_display}\\n\\nWhat would you like?\\n✈️ Flights\\n🏨 Hotels\\n📋 Full Itinerary\\n\\n(Pick one, two, or all three!)"}}
+
+  • User replies with their choice → call the tool(s).
+
+═══════════════════════════════════════════════════════
+DATE RULES
+═══════════════════════════════════════════════════════
+1. Today is {today}. Reject any past date.
+2. Day+month only → assume nearest future year. Never ask for year.
+3. "N days" → compute return_date = departure_date + N days.
+4. Always use "D Mon YYYY" format e.g. "22 Sep 2026".
+5. A single date is ALWAYS the departure date, never both departure and
+   return. Never invent a same-day return on your own.
+
+═══════════════════════════════════════════════════════
+BUDGET RULES
+═══════════════════════════════════════════════════════
+1. Budget is OPTIONAL — the user may give a number or say "skip"/"flexible"/"no budget".
+2. If a budget IS given: pass it to every tool call and ask each tool's
+   presentation step to filter/flag options against it.
+3. If the user skipped it: pass an empty budget ("") and present all options
+   normally with no budget filtering or notes.
+
+═══════════════════════════════════════════════════════
+TOOL CALLING RULES
+═══════════════════════════════════════════════════════
+- "flights"              → search_flights only
+- "hotels"               → search_hotels only
+- "itinerary" / "plan"   → build_itinerary only
+- "flights and hotels"   → search_flights line 1, search_hotels line 2
+- "all" / "everything"   → all 3 tools, one per line
+
+═══════════════════════════════════════════════════════
+ABSOLUTE RULES
+═══════════════════════════════════════════════════════
+1. NEVER output plain text. Every response = JSON object.
+2. NEVER ask for a field that already shows a value in ALREADY COLLECTED.
+3. NEVER call a search tool before all required fields are collected.
+4. Multiple tools = one JSON per line, nothing else between them.
+5. Dates always "D Mon YYYY" format.
+6. chat messages: short, warm, friendly — 1–2 sentences max.
+"""
+
+
+def _geocode(query: str):
+    """Geocode via Nominatim, with an in-process cache. Returns (lat, lng, display_name) or None."""
+    key = query.strip().lower()
+    if key in _GEOCODE_CACHE:
+        return _GEOCODE_CACHE[key]
+    try:
+        r = requests.get(
+            NOMINATIM_URL,
+            params={"q": query, "format": "json", "limit": 1},
+            headers=NOMINATIM_HEADERS,
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if data:
+            result = (float(data[0]["lat"]), float(data[0]["lon"]), data[0].get("display_name", query))
+            _GEOCODE_CACHE[key] = result
+            return result
+        else:
+            print(f"[GEOCODE] no results for '{query}'")
+    except Exception as e:
+        print(f"[GEOCODE] failed for '{query}': {e}")
+    _GEOCODE_CACHE[key] = None
+    return None
+
+
+def _haversine(lat1, lng1, lat2, lng2) -> float:
+    import math
+    R = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlng = math.radians(lng2 - lng1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlng / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+def _extract_hotel_names(raw_hotel_text: str) -> list:
+    """Pull hotel names from the markdown table (lines like | Hotel Name | ...)."""
+    names = []
+    for line in raw_hotel_text.splitlines():
+        line = line.strip()
+        if not line.startswith("|") or "Hotel Name" in line or "---" in line:
+            continue
+        parts = [p.strip() for p in line.split("|") if p.strip()]
+        if parts:
+            name = re.sub(r"\*+", "", parts[0]).strip()
+            if name:
+                names.append(name)
+    return names
+
+
+def _extract_itinerary_place_names(itinerary_text: str) -> list:
+    """
+    Pull candidate place names (attractions, restaurants, activities, beaches,
+    landmarks, etc.) out of free-form itinerary markdown.
+    """
+    STOPWORD_PATTERNS = [
+        r"\bbreakfast\b", r"\blunch\b", r"\bdinner\b",
+        r"\bcheck[\s-]?in\b", r"\bcheck[\s-]?out\b",
+        r"\bfree time\b", r"\bdeparture\b", r"\barrival\b", r"\btransfer\b",
+        r"\brest\b", r"\brelax(?:ation)?\b", r"^morning$", r"^afternoon$",
+        r"^evening$", r"\boverview\b", r"^day\b", r"\boptional\b",
+        r"\bnotes?\b", r"\btips?\b", r"\bsummary\b", r"^itinerary$",
+        r"\bat the hotel\b", r"\bhotel\b$",
+    ]
+
+    candidates = set()
+
+    for m in re.finditer(r"\*\*([^*\n]{3,60})\*\*", itinerary_text):
+        name = m.group(1).strip()
+        if name.lower().startswith("day "):
+            continue
+        candidates.add(name)
+
+    for line in itinerary_text.splitlines():
+        line = line.strip()
+        m = re.match(r"^[-*]\s+([A-Z][A-Za-z0-9'&. ]{2,50}?)(?:\s*[:—(]|\s+-\s|\s*$)", line)
+        if m:
+            candidates.add(m.group(1).strip())
+
+    for line in itinerary_text.splitlines():
+        line = line.strip()
+        if not line.startswith("|") or "---" in line:
+            continue
+        parts = [p.strip() for p in line.split("|") if p.strip()]
+        if parts:
+            name = re.sub(r"\*+", "", parts[0]).strip()
+            if name and not re.match(r"^(day|time|date)\b", name, re.IGNORECASE):
+                candidates.add(name)
+
+    cleaned = []
+    for name in candidates:
+        low = name.lower().strip()
+        if len(low) < 3:
+            continue
+        if any(re.search(pat, low) for pat in STOPWORD_PATTERNS):
+            continue
+        if re.fullmatch(r"day\s*\d+", low):
+            continue
+        cleaned.append(name)
+
+    return cleaned
+
+
+def _geocode_city_marker(city: str, label: str, marker_type: str):
+    """Geocode a single city for use as a route/city marker. Returns a location dict or None."""
+    geo = _geocode(city)
+    if not geo:
+        return None
+    lat, lng, display = geo
+    return {
+        "name": label,
+        "type": marker_type,   # "origin" | "destination"
+        "lat": lat,
+        "lng": lng,
+        "address": display,
+    }
+
+
+def _geocode_named_places(dst: str, names: list, marker_type: str, query_suffix: str = "") -> list:
+    """
+    Shared geocoding engine: takes a list of place names near a destination
+    city and resolves each to real lat/lng via Nominatim, tagging each
+    result with marker_type ("hotel", "attraction", etc.) for the map.
+    """
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Lock
+
+    if not names:
+        return []
+
+    anchor = _geocode(dst)
+    anchor_lat, anchor_lng = (anchor[0], anchor[1]) if anchor else (None, None)
+
+    _rate_lock = Lock()
+    _last_call = {"t": 0.0}
+
+    def _rate_limited_geocode(q: str):
+        key = q.strip().lower()
+        if key in _GEOCODE_CACHE:
+            return _GEOCODE_CACHE[key]
+        with _rate_lock:
+            wait = _last_call["t"] + 1.1 - time.time()
+            if wait > 0:
+                time.sleep(wait)
+            result = _geocode(q)
+            _last_call["t"] = time.time()
+            return result
+
+    def _resolve(name: str):
+        primary_q = f"{query_suffix} {name}, {dst}".strip() if query_suffix else f"{name}, {dst}"
+        geo = _rate_limited_geocode(primary_q)
+        if not geo and query_suffix:
+            geo = _rate_limited_geocode(f"{name}, {dst}")
+        if not geo:
+            return None
+        lat, lng, display = geo
+        if anchor_lat is not None:
+            dist = _haversine(anchor_lat, anchor_lng, lat, lng)
+            if dist > 60:
+                print(f"[GEOCODE] Skipping '{name}' — {dist:.0f}km from {dst}")
+                return None
+        return {
+            "name": name,
+            "type": marker_type,
+            "lat": lat,
+            "lng": lng,
+            "address": display,
+        }
+
+    locations = []
+    seen_coords = set()
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        for result in ex.map(_resolve, names):
+            if result:
+                coord_key = (round(result["lat"], 4), round(result["lng"], 4))
+                if coord_key in seen_coords:
+                    continue
+                seen_coords.add(coord_key)
+                locations.append(result)
+
+    return locations
+
+
+def _geocode_hotels(dst: str, raw_hotel_text: str) -> list:
+    names = _extract_hotel_names(raw_hotel_text)
+    return _geocode_named_places(dst, names, marker_type="hotel", query_suffix="hotel")
+
+
+def _geocode_itinerary_places(dst: str, itinerary_text: str) -> list:
+    names = _extract_itinerary_place_names(itinerary_text)
+    return _geocode_named_places(dst, names, marker_type="attraction")
+
+
+def _stream_generate(prompt: str):
+    """Streaming single-prompt completion — backed by Groq."""
+    yield from _llm_stream_generate(prompt)
+
+
+def _stream_chat(messages: list):
+    """Streaming multi-turn chat completion — backed by Groq."""
+    yield from _llm_stream_generate(messages)
+
+
+def _llm_decide(messages: list) -> str:
+    """Non-streaming multi-turn chat completion — backed by Groq."""
+    return _llm_generate_full(messages)
 
 
 def _extract_all_tools(text: str) -> list:
-    """
-    Pure parsing — turns the LLM's raw text into a list of tool-call dicts.
-    This is NOT validation of the tool calls' content (dates, fields, etc.)
-    — it only recovers the JSON structure(s) the LLM intended to produce,
-    tolerating minor formatting slips (code fences, trailing commas, single
-    quotes) since those are JSON syntax issues, not decision issues.
-    """
     text = re.sub(r"```(?:json)?|```", "", text).strip()
     try:
         d = json.loads(text)
@@ -99,10 +782,7 @@ def _extract_all_tools(text: str) -> list:
     return []
 
 
-async def _force_retry(messages: list, original: str) -> list:
-    """If the LLM's output couldn't be parsed as JSON at all, ask it once
-    more to reformat — still not a content/decision override, purely a
-    formatting nudge."""
+def _force_retry(messages: list, original: str) -> list:
     retry = messages + [
         {"role": "assistant", "content": original},
         {"role": "user", "content":
@@ -112,29 +792,19 @@ async def _force_retry(messages: list, original: str) -> list:
             "Output only the JSON, nothing else."
         }
     ]
-    content = await _llm_generate_full(retry)
+    content = _llm_generate_full(retry)
     return _extract_all_tools(content)
 
 
-def _build_messages(history_rows, new_message: str) -> list:
+def _build_messages(history_rows, new_message: str, known: dict) -> list:
     """
-    Builds the full message list sent to the LLM: system prompt (with
-    today's real date — the only fact Python supplies) + the ENTIRE raw
-    chat history + the new message. The LLM re-derives all field state from
-    this history itself every turn; Python does not pre-process, extract,
-    or summarize any of it (beyond trimming very long historical assistant
-    replies so the context window doesn't balloon with old flight/hotel
-    tables — that trimming is purely a token-budget concern, not a
-    decision-relevant one, since the LLM only needs to know that a result
-    was already shown, not its exact previous content, to keep the
-    conversation moving).
+    history_rows are plain Mongo dicts, so role/message are accessed via
+    row["role"] / row["message"], not row.role / row.message.
     """
-    today_str = TODAY.strftime("%-d %b %Y")
-    today_weekday = TODAY.strftime("%A")
-    msgs = [{"role": "system", "content": build_system_prompt(today_str, today_weekday)}]
+    msgs = [{"role": "system", "content": _build_system(known)}]
     for row in history_rows:
-        role = "assistant" if row.role == "assistant" else "user"
-        content = row.message
+        role = "assistant" if row["role"] == "assistant" else "user"
+        content = row["message"]
         if role == "assistant" and len(content) > 600:
             content = "[Full travel response shown to user]"
         msgs.append({"role": role, "content": content})
@@ -142,10 +812,81 @@ def _build_messages(history_rows, new_message: str) -> list:
     return msgs
 
 
-async def _stream_text(text: str):
-    """Async version of character-by-character text streaming."""
+def _days_between(dep: str, ret: str) -> int:
+    for fmt in ["%d %b %Y", "%d %B %Y", "%d %b", "%d %B"]:
+        try:
+            return max(
+                (datetime.strptime(ret.strip(), fmt) - datetime.strptime(dep.strip(), fmt)).days, 1
+            )
+        except Exception:
+            pass
+    return 3
+
+
+def _add_days(dep: str, days: int) -> str:
+    for fmt in ["%d %b %Y", "%d %b"]:
+        try:
+            return (datetime.strptime(dep.strip(), fmt) + timedelta(days=days)).strftime("%-d %b %Y")
+        except Exception:
+            pass
+    return ""
+
+
+def _stream_text(text: str):
     for ch in text:
         yield ch
+
+
+def _iter_async_gen(async_gen):
+    """
+    Bridge an async generator to a plain synchronous iterator.
+
+    travel_agent / _run_tool are sync generators (called via a plain
+    `for chunk in travel_agent(...)` in chat.py, executing inside
+    FastAPI/Starlette's already-running event loop), but build_itnerary
+    is an async generator. A naive `asyncio.new_event_loop().
+    run_until_complete(...)` fails here with "Cannot run the event loop
+    while another loop is running", because the calling thread already
+    has one running.
+
+    Instead, this drains the async generator to completion on a
+    dedicated background thread (which has no event loop of its own),
+    forwarding each chunk back to this thread via a queue as it arrives,
+    so the caller can consume it as an ordinary synchronous iterator.
+    """
+    import asyncio
+    import threading
+    import queue
+
+    q: "queue.Queue" = queue.Queue()
+    _SENTINEL = object()
+
+    def _runner():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            async def _drain():
+                async for item in async_gen:
+                    q.put(item)
+            loop.run_until_complete(_drain())
+        except Exception as e:
+            q.put(e)
+        finally:
+            q.put(_SENTINEL)
+            loop.close()
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+
+    while True:
+        item = q.get()
+        if item is _SENTINEL:
+            break
+        if isinstance(item, Exception):
+            raise item
+        yield item
+
+    thread.join()
 
 
 def _budget_line(budget: str) -> str:
@@ -154,181 +895,41 @@ def _budget_line(budget: str) -> str:
     return ""
 
 
-async def _emit_locations(locations: list):
-    """Yield a single LOCATIONS_JSON marker comment if there's anything to
-    show. Called exactly once per turn, after all tool calls in that turn
-    have finished collecting locations — see _dedupe_add and travel_agent."""
+def _emit_locations(locations: list):
+    """Yield a LOCATIONS_JSON marker comment if there's anything to show."""
     if locations:
         json_str = json.dumps(locations, ensure_ascii=False)
         yield f"\n\n<!--LOCATIONS_JSON:{json_str}-->"
 
 
-def _dedupe_add(collected_locations: list, new_locations: list):
-    """Append new_locations into collected_locations, skipping anything
-    whose coordinates already match something already collected (~11m
-    tolerance), so the same spot never gets pinned twice when multiple
-    tools in one turn reference it."""
-    existing_coords = {
-        (round(loc["lat"], 4), round(loc["lng"], 4)) for loc in collected_locations
-    }
-    for loc in new_locations:
-        key = (round(loc["lat"], 4), round(loc["lng"], 4))
-        if key not in existing_coords:
-            collected_locations.append(loc)
-            existing_coords.add(key)
-
-
-async def _geocode(query: str):
-    """Async geocode via Nominatim with in-process cache and 1 req/sec rate
-    limit enforced by a semaphore + asyncio.sleep (no thread blocking).
-    Returns (lat, lng, display_name) or None. Pure data lookup — not validation."""
-    global _LAST_GEOCODE_TIME
-
-    key = query.strip().lower()
-    if key in _GEOCODE_CACHE:
-        return _GEOCODE_CACHE[key]
-
-    async with _GEOCODE_SEMAPHORE:
-        # Re-check cache in case another coroutine filled it while we waited
-        if key in _GEOCODE_CACHE:
-            return _GEOCODE_CACHE[key]
-
-        now = asyncio.get_event_loop().time()
-        wait = _LAST_GEOCODE_TIME + 1.1 - now
-        if wait > 0:
-            await asyncio.sleep(wait)
-
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.get(
-                    NOMINATIM_URL,
-                    params={"q": query, "format": "json", "limit": 1},
-                    headers=NOMINATIM_HEADERS,
-                )
-                r.raise_for_status()
-                data = r.json()
-            _LAST_GEOCODE_TIME = asyncio.get_event_loop().time()
-            if data:
-                result = (float(data[0]["lat"]), float(data[0]["lon"]), data[0].get("display_name", query))
-                _GEOCODE_CACHE[key] = result
-                return result
-            else:
-                print(f"[GEOCODE] no results for '{query}'")
-        except Exception as e:
-            print(f"[GEOCODE] failed for '{query}': {e}")
-            _LAST_GEOCODE_TIME = asyncio.get_event_loop().time()
-
-    _GEOCODE_CACHE[key] = None
-    return None
-
-
-async def _geocode_city_marker(city: str, label: str, marker_type: str):
-    geo = await _geocode(city)
-    if not geo:
-        return None
-    lat, lng, display = geo
-    return {"name": label, "type": marker_type, "lat": lat, "lng": lng, "address": display}
-
-
-def _haversine(lat1, lng1, lat2, lng2) -> float:
-    import math
-    R = 6371.0
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dlat = math.radians(lat2 - lat1)
-    dlng = math.radians(lng2 - lng1)
-    a = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlng / 2) ** 2
-    return 2 * R * math.asin(math.sqrt(a))
-
-
-def _extract_hotel_names(raw_hotel_text: str) -> list:
-    """Pull hotel names from a markdown table (lines like | Hotel Name | ...).
-    Pure text parsing of the tool's already-generated output — not a
-    decision point."""
-    names = []
-    for line in raw_hotel_text.splitlines():
-        line = line.strip()
-        if not line.startswith("|") or "Hotel Name" in line or "---" in line:
-            continue
-        parts = [p.strip() for p in line.split("|") if p.strip()]
-        if parts:
-            name = re.sub(r"\*+", "", parts[0]).strip()
-            if name:
-                names.append(name)
-    return names
-
-
-async def _geocode_named_places(dst: str, names: list, marker_type: str, query_suffix: str = "") -> list:
-    """Async version of _geocode_named_places.
-    Geocodes all names concurrently — the semaphore inside _geocode
-    already ensures Nominatim's 1 req/sec limit is respected, so there is
-    no need for a separate ThreadPoolExecutor or time.sleep here."""
-    if not names:
-        return []
-
-    anchor = await _geocode(dst)
-    anchor_lat, anchor_lng = (anchor[0], anchor[1]) if anchor else (None, None)
-
-    async def _resolve(name: str):
-        primary_q = f"{query_suffix} {name}, {dst}".strip() if query_suffix else f"{name}, {dst}"
-        geo = await _geocode(primary_q)
-        if not geo and query_suffix:
-            geo = await _geocode(f"{name}, {dst}")
-        if not geo:
-            return None
-        lat, lng, display = geo
-        if anchor_lat is not None:
-            dist = _haversine(anchor_lat, anchor_lng, lat, lng)
-            if dist > 60:
-                print(f"[GEOCODE] Skipping '{name}' — {dist:.0f}km from {dst}")
-                return None
-        return {"name": name, "type": marker_type, "lat": lat, "lng": lng, "address": display}
-
-    results = await asyncio.gather(*[_resolve(name) for name in names])
-
-    locations = []
-    seen_coords = set()
-    for result in results:
-        if result:
-            coord_key = (round(result["lat"], 4), round(result["lng"], 4))
-            if coord_key in seen_coords:
-                continue
-            seen_coords.add(coord_key)
-            locations.append(result)
-    return locations
-
-
-async def _run_tool(tool_call: dict, collected_locations: list):
-    """
-    Executes exactly one tool call already decided by the LLM. Every field
-    used here (source, destination, departure_date, return_date, budget,
-    days) comes directly from the tool_call dict the LLM produced — Python
-    does not fall back to any locally-tracked "known" state, because there
-    is none; the LLM is the only place state lives.
-    """
+def _run_tool(tool_call: dict, known: dict):
     tool = tool_call.get("tool")
 
+    # ── chat ──────────────────────────────────────────────────────────────────
     if tool == "chat":
-        async for ch in _stream_text(tool_call.get("message", "")):
-            yield ch
+        yield from _stream_text(tool_call.get("message", ""))
         return
 
+    # ── search_flights ────────────────────────────────────────────────────────
     if tool == "search_flights":
-        src    = tool_call.get("source", "")
-        dst    = tool_call.get("destination", "")
-        dep    = tool_call.get("departure_date", "")
-        ret    = tool_call.get("return_date", "") or ""
-        budget = tool_call.get("budget", "") or ""
+        src    = tool_call.get("source", "")    or known.get("source", "")
+        dst    = tool_call.get("destination","") or known.get("destination", "")
+        dep    = tool_call.get("departure_date","") or known.get("departure_date","")
+        ret    = tool_call.get("return_date") or known.get("return_date","") or ""
+        budget = tool_call.get("budget") or known.get("budget","") or ""
+        days   = tool_call.get("days")
+        if days and dep and not ret:
+            ret = _add_days(dep, int(days))
 
-        async for ch in _stream_text(f"Searching flights from **{src}** to **{dst}** on {dep}... ✈️\n\n"):
-            yield ch
+        yield from _stream_text(f"Searching flights from **{src}** to **{dst}** on {dep}... ✈️\n\n")
 
         try:
-            raw = await search_flight(src, dst, dep, ret, budget)
+            raw = search_flight(src, dst, dep, ret, budget)
         except Exception as e:
             yield f"Sorry, couldn't fetch flights: {e}"
             return
 
-        async for token in _stream_generate(f"""You are a friendly travel assistant. Present these flight results in warm, clear Markdown.
+        yield from _stream_generate(f"""You are a friendly travel assistant. Present these flight results in warm, clear Markdown.
 {_budget_line(budget)}
 Route: {src} → {dst}
 {f"Departure: {dep} | Return: {ret}" if ret else f"Departure: {dep} (one-way)"}
@@ -364,50 +965,39 @@ Rules:
 - The tables are mandatory — never fall back to a bullet list or inline pipe text.
 - Keep cell values short (no extra emoji inside table cells).
 - Be warm and conversational only in the intro sentence and the Best Pick line, not inside the table.
-"""):
-            yield token
+""")
 
+        # ── Route markers for the map (origin + destination cities) ─────────
         try:
-            new_locs = []
-            origin_marker = await _geocode_city_marker(src, src, "origin")
-            dest_marker = await _geocode_city_marker(dst, dst, "destination")
+            locations = []
+            origin_marker = _geocode_city_marker(src, src, "origin")
+            dest_marker = _geocode_city_marker(dst, dst, "destination")
             if origin_marker:
-                new_locs.append(origin_marker)
+                locations.append(origin_marker)
             if dest_marker:
-                new_locs.append(dest_marker)
-            _dedupe_add(collected_locations, new_locs)
+                locations.append(dest_marker)
+            yield from _emit_locations(locations)
         except Exception as e:
             print(f"[AGENT] flight route geocoding failed: {e}")
         return
 
+    # ── search_hotels ─────────────────────────────────────────────────────────
     if tool == "search_hotels":
-        dst       = tool_call.get("destination", "")
-        check_in  = tool_call.get("check_in", "")
-        check_out = tool_call.get("check_out", "")
-        budget    = tool_call.get("budget", "") or ""
+        dst      = tool_call.get("destination","") or known.get("destination","")
+        check_in = tool_call.get("check_in","")    or known.get("departure_date","")
+        check_out= tool_call.get("check_out","")   or known.get("return_date","")
+        budget   = tool_call.get("budget") or known.get("budget","") or ""
+        nights   = _days_between(check_in, check_out)
+
+        yield from _stream_text(f"Searching hotels in **{dst}** ({check_in} → {check_out})... 🏨\n\n")
 
         try:
-            nights = max(
-                (datetime.strptime(check_out, "%d %b %Y") - datetime.strptime(check_in, "%d %b %Y")).days, 1
-            )
-        except Exception:
-            nights = 1
-
-        async for ch in _stream_text(f"Searching hotels in **{dst}** ({check_in} → {check_out})... 🏨\n\n"):
-            yield ch
-
-        try:
-            raw = await search_hotel(dst, check_in, check_out, budget)
+            raw = search_hotel(dst, check_in, check_out, budget)
         except Exception as e:
             yield f"Sorry, couldn't fetch hotels: {e}"
             return
 
-        # Stream live while holding back a small trailing buffer long enough
-        # to contain the PLACES marker, so the marker itself never reaches
-        # the visible chat — same pattern used for the itinerary tool below.
-        HOLD_BACK = 200
-        pending = ""
-        async for chunk in _stream_generate(f"""You are a friendly travel assistant. Present these hotel options in warm, clear Markdown.
+        yield from _stream_generate(f"""You are a friendly travel assistant. Present these hotel options in warm, clear Markdown.
 {_budget_line(budget)}
 Destination: {dst} | {check_in} – {check_out} | {nights} nights
 
@@ -447,177 +1037,120 @@ Rules:
 - Keep cell values short (no extra emoji inside table cells).
 - Only include a section heading + table if that category has at least one hotel.
 - Be warm and conversational only in the intro sentence and the Top Pick line, not inside the tables.
-
-FINAL LINE OF YOUR OUTPUT — MANDATORY: after everything above, on its own final line, output exactly the hotel names you used in the tables (the EXACT same spelling, every hotel from every table, no extras, no omissions) as this hidden marker so they can be pinned on a map:
-<!--PLACES:[{{"name":"Exact Hotel Name 1","type":"hotel"}},{{"name":"Exact Hotel Name 2","type":"hotel"}}]-->
-This marker line is required even though it won't be shown to the user — never skip it, never leave the array empty if you listed any hotels above.
-"""):
-            pending += chunk
-            if len(pending) > HOLD_BACK:
-                safe_to_emit = pending[:-HOLD_BACK]
-                if "<!--PLACES" not in safe_to_emit:
-                    yield safe_to_emit
-                    pending = pending[-HOLD_BACK:]
-        presentation_text = pending  # only the trailing hold-back remains unflushed
-
-        # Reconstruct the full text for marker parsing by re-running isn't
-        # possible (generator already exhausted) — but since everything up
-        # to the marker was already streamed out, `pending` at this point
-        # holds exactly the tail containing the marker (HOLD_BACK is sized
-        # generously larger than the marker itself).
-        places_marker = re.search(r"<!--PLACES:(\[[\s\S]*?\])-->", presentation_text)
-        visible_text = re.sub(r"\n*<!--PLACES:[\s\S]*?-->", "", presentation_text)
-        if visible_text:
-            yield visible_text
-
-        hotel_names = []
-        if places_marker:
-            try:
-                parsed = json.loads(places_marker.group(1))
-                hotel_names = [p["name"] for p in parsed if isinstance(p, dict) and p.get("name")]
-            except Exception as e:
-                print(f"[AGENT] failed to parse hotel PLACES marker: {e}")
-        if not hotel_names:
-            # Fallback only if the LLM forgot the marker entirely — still not
-            # "extra validation" of its decisions, just a safety net so a
-            # missed marker doesn't mean zero pins; reuses the same table
-            # text the LLM already produced rather than re-asking it.
-            print("[AGENT] hotel PLACES marker missing — falling back to table scrape")
-            hotel_names = _extract_hotel_names(raw)
+""")
 
         try:
-            hotel_locs = await _geocode_named_places(dst, hotel_names, marker_type="hotel", query_suffix="hotel")
-            dest_marker = await _geocode_city_marker(dst, dst, "destination")
-            new_locs = list(hotel_locs)
+            extracted_names = _extract_hotel_names(raw)
+            print(f"[AGENT] hotel names extracted from raw text: {extracted_names}")
+            locations = _geocode_hotels(dst, raw)
+            print(f"[AGENT] hotel locations geocoded: {len(locations)} of {len(extracted_names)} names resolved")
+            dest_marker = _geocode_city_marker(dst, dst, "destination")
             if dest_marker and not any(
                 abs(loc["lat"] - dest_marker["lat"]) < 1e-6 and abs(loc["lng"] - dest_marker["lng"]) < 1e-6
-                for loc in new_locs
+                for loc in locations
             ):
-                new_locs.insert(0, dest_marker)
-            print(f"[AGENT] hotels: {len(hotel_names)} names → {len(hotel_locs)} geocoded")
-            _dedupe_add(collected_locations, new_locs)
+                locations.insert(0, dest_marker)
+            print(f"[AGENT] emitting {len(locations)} total locations for hotels tool")
+            yield from _emit_locations(locations)
         except Exception as e:
             print(f"[AGENT] hotel geocoding failed: {e}")
         return
 
+    # ── build_itinerary ───────────────────────────────────────────────────────
     if tool == "build_itinerary":
-        src    = tool_call.get("source", "")
-        dst    = tool_call.get("destination", "")
-        dep    = tool_call.get("departure_date", "")
-        ret    = tool_call.get("return_date", "")
-        budget = tool_call.get("budget", "") or ""
+        src    = tool_call.get("source","")         or known.get("source","")
+        dst    = tool_call.get("destination","")    or known.get("destination","")
+        dep    = tool_call.get("departure_date","") or known.get("departure_date","")
+        ret    = tool_call.get("return_date","")    or known.get("return_date","") or ""
+        budget = tool_call.get("budget") or known.get("budget","") or ""
+        days   = tool_call.get("days")
+
+        if days and dep and not ret:
+            ret = _add_days(dep, int(days))
+        if not days:
+            days = _days_between(dep, ret)
         try:
-            days = int(tool_call.get("days") or 3)
+            days = int(days)
         except Exception:
             days = 3
 
-        async for ch in _stream_text(
+        yield from _stream_text(
             f"Let's build your **{days}-day trip** from **{src}** to **{dst}** "
             f"({dep} → {ret})! 🎉 Fetching flights and hotels first...\n\n"
-        ):
-            yield ch
+        )
 
-        # Fetch flights AND hotels concurrently — cuts wait time in half
         try:
-            flights, hotels = await asyncio.gather(
-                search_flight(src, dst, dep, ret, budget),
-                search_hotel(dst, dep, ret, budget),
-            )
+            flights = search_flight(src, dst, dep, ret, budget)
         except Exception as e:
             flights = f"(Flights unavailable: {e})"
-            hotels  = f"(Hotels unavailable: {e})"
+        try:
+            hotels = search_hotel(dst, dep, ret, budget)
+        except Exception as e:
+            hotels = f"(Hotels unavailable: {e})"
 
-        # build_itnerary (itinerary.py) already does the right thing here:
-        # it makes its OWN dedicated LLM call asking for real place NAMES
-        # (the chosen hotel + 6-10 real attractions) before writing a single
-        # word of the itinerary, geocodes exactly those names, weaves an
-        # "use these exact names" hint into the itinerary-writing prompt so
-        # the prose matches the pins, and appends its own
-        # <!--LOCATIONS_JSON:...--> comment at the end of its stream. That
-        # is a cleaner, more reliable pattern than regex-scraping bolded
-        # words back out of free-form prose after the fact (which is what
-        # this block used to do, and which is exactly the kind of brittle
-        # matching that caused hotels/attractions to go missing before).
-        # So here we simply tee the stream through to the user, strip out
-        # build_itnerary's own marker before re-displaying it (the combined
-        # marker for the WHOLE turn is emitted once at the very end by
-        # travel_agent, not per-tool), and fold its locations into the
-        # shared collected_locations list like every other tool does.
-        # Stream live to the user as build_itnerary generates, while holding
-        # back a small trailing buffer (long enough to contain the marker
-        # comment) so the <!--LOCATIONS_JSON:...--> tag itself never reaches
-        # the visible chat — only flush text once we're sure it isn't part
-        # of the marker. This preserves real-time streaming instead of
-        # buffering the entire itinerary before showing anything.
-        HOLD_BACK = 200  # generous margin over a typical marker's length
-        pending = ""
-        full_chunks = []
-        async for chunk in build_itnerary(
+        itinerary_chunks = []
+        for chunk in _iter_async_gen(build_itnerary(
             {"source": src, "destination": dst,
              "departure_date": dep, "return_date": ret, "days": days, "budget": budget},
             flights, hotels,
-        ):
-            full_chunks.append(chunk)
-            pending += chunk
-            if len(pending) > HOLD_BACK:
-                safe_to_emit = pending[:-HOLD_BACK]
-                if "<!--LOCATIONS_JSON" not in safe_to_emit:
-                    yield safe_to_emit
-                    pending = pending[-HOLD_BACK:]
-                # else: a marker start is inside the safe region — hold
-                # everything until the full marker (and its closing -->)
-                # has arrived, then the final flush below handles it.
-        itinerary_full = "".join(full_chunks)
-
-        marker_match = re.search(r"<!--LOCATIONS_JSON:(\[[\s\S]*?\])-->", itinerary_full)
-        # Flush whatever's left in `pending`, with the marker stripped out.
-        remaining_visible = re.sub(r"\n*<!--LOCATIONS_JSON:[\s\S]*?-->", "", pending)
-        if remaining_visible:
-            yield remaining_visible
-
-        itinerary_locs = []
-        if marker_match:
-            try:
-                itinerary_locs = json.loads(marker_match.group(1))
-                print(f"[AGENT] itinerary tool: {len(itinerary_locs)} locations from build_itnerary's own LLM-driven place lookup")
-            except Exception as e:
-                print(f"[AGENT] failed to parse itinerary's own LOCATIONS_JSON: {e}")
-        else:
-            print("[AGENT] itinerary tool: build_itnerary produced no LOCATIONS_JSON marker at all — map will only show origin/destination for this turn")
+        )):
+            itinerary_chunks.append(chunk)
+            yield chunk
+        itinerary_text = "".join(itinerary_chunks)
 
         try:
-            new_locs = []
-            # Geocode origin and destination concurrently
-            origin_marker, dest_marker = await asyncio.gather(
-                _geocode_city_marker(src, src, "origin"),
-                _geocode_city_marker(dst, dst, "destination"),
-            )
+            locations = []
+            origin_marker = _geocode_city_marker(src, src, "origin")
+            dest_marker = _geocode_city_marker(dst, dst, "destination")
             if origin_marker:
-                new_locs.append(origin_marker)
+                locations.append(origin_marker)
             if dest_marker:
-                new_locs.append(dest_marker)
-            new_locs.extend(itinerary_locs)
-            _dedupe_add(collected_locations, new_locs)
+                locations.append(dest_marker)
+
+            hotel_locations = _geocode_hotels(dst, hotels)
+            print(f"[AGENT] itinerary tool: {len(hotel_locations)} hotel locations resolved")
+            locations.extend(hotel_locations)
+
+            extracted_place_names = _extract_itinerary_place_names(itinerary_text)
+            print(f"[AGENT] itinerary place names extracted: {extracted_place_names}")
+            itinerary_locations = _geocode_itinerary_places(dst, itinerary_text)
+            print(f"[AGENT] itinerary tool: {len(itinerary_locations)} of {len(extracted_place_names)} place names resolved")
+            existing_coords = {(round(loc["lat"], 4), round(loc["lng"], 4)) for loc in locations}
+            for loc in itinerary_locations:
+                key = (round(loc["lat"], 4), round(loc["lng"], 4))
+                if key not in existing_coords:
+                    locations.append(loc)
+                    existing_coords.add(key)
+
+            print(f"[AGENT] emitting {len(locations)} total locations for itinerary tool")
+            yield from _emit_locations(locations)
         except Exception as e:
             print(f"[AGENT] itinerary geocoding failed: {e}")
         return
 
 
-async def travel_agent(chat_id: str, message: str, db):
-    """
-    Single entry point. Every decision in here — whether a field is known,
-    whether a date is valid, what to ask next, which tool(s) to call, how
-    to respond to a greeting — comes from ONE LLM call (_llm_decide) given
-    today's real date plus the full chat history. Python performs zero
-    extraction, zero validation, and zero overriding of that decision.
-    """
+def travel_agent(chat_id: str, message: str, db):
     history = get_chat_history(db=db, chat_id=chat_id)
 
-    messages = _build_messages(history, message)
+    # ── DATE VALIDATION ───────────────────────────────────────────────────────
+    valid, error_msg = _validate_dates_in_message(message)
+    if not valid:
+        yield from _stream_text(error_msg)
+        return
+
+    # ── EXTRACT ALL KNOWN FIELDS FROM HISTORY + CURRENT MESSAGE ──────────────
+    # history items are Mongo dicts (role/message keys), so the "current
+    # message" placeholder must match that same shape rather than the old
+    # SQLAlchemy-row-style object.
+    all_rows = list(history) + [{"role": "user", "message": message}]
+    known = _rebuild_known_fields(all_rows)
+    print(f"[AGENT] known={known}")
+
+    messages = _build_messages(history, message, known)
     print(f"[AGENT] chat={chat_id} history={len(history)}")
 
     try:
-        decision = await _llm_decide(messages)
+        decision = _llm_decide(messages)
     except Exception as e:
         yield f"Sorry, I can't reach the AI model right now. ({e})"
         return
@@ -628,33 +1161,27 @@ async def travel_agent(chat_id: str, message: str, db):
 
     if not tool_calls:
         print("[AGENT] Parse failed — retrying")
-        tool_calls = await _force_retry(messages, decision)
+        tool_calls = _force_retry(messages, decision)
 
     if not tool_calls:
         print("[AGENT] Retry failed — streaming plain reply")
         try:
-            async for token in _stream_chat(messages):
+            for token in _stream_chat(messages):
                 yield token
         except Exception:
             yield decision
         return
 
-    print(f"[AGENT] Tools → {[t.get('tool') for t in tool_calls]}")
+    # ── PYTHON SAFETY NET ─────────────────────────────────────────────────────
+    before = [t.get("tool") for t in tool_calls]
+    tool_calls = _enforce_missing_field(tool_calls, known)
+    after = [t.get("tool") for t in tool_calls]
+    if before != after:
+        print(f"[AGENT] Guardrail overrode premature tool use {before} → {after}")
 
-    # Shared across all tool calls in this turn — exactly one combined
-    # LOCATIONS_JSON comment is emitted at the end, after every tool call
-    # has had a chance to contribute locations. This matters because the
-    # frontend only reads the first such comment in a response; emitting
-    # one per tool (as an earlier version did) meant only the first tool's
-    # locations (e.g. flights' origin+destination) were ever visible when
-    # multiple tools ran in the same turn.
-    collected_locations: list = []
+    print(f"[AGENT] Tools → {[t.get('tool') for t in tool_calls]}")
 
     for i, tool_call in enumerate(tool_calls):
         if i > 0:
             yield "\n\n---\n\n"
-        async for chunk in _run_tool(tool_call, collected_locations):
-            yield chunk
-
-    async for chunk in _emit_locations(collected_locations):
-        yield chunk
+        yield from _run_tool(tool_call, known)
